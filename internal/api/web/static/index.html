@@ -1,1 +1,140 @@
-<!doctype html><title>muxprune</title>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>muxprune</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='80' font-size='80'>&#9986;</text></svg>">
+</head>
+<body>
+<header>
+  <h1>&#9986; muxprune</h1>
+  <nav>
+    <button data-view="files" class="active">Files</button>
+    <button data-view="libraries">Libraries</button>
+    <button data-view="jobs">Jobs</button>
+  </nav>
+  <div id="stats" class="stats"></div>
+</header>
+
+<main>
+  <section id="view-files">
+    <div class="toolbar">
+      <select id="filter-library"><option value="">All libraries</option></select>
+      <input id="filter-q" type="search" placeholder="Search title / path...">
+      <span class="spacer"></span>
+      <span id="selection-info"></span>
+      <button id="btn-batch" disabled>Batch action...</button>
+    </div>
+    <div id="scan-progress" class="scan-progress" hidden></div>
+    <table id="files-table">
+      <thead><tr>
+        <th class="col-check"><input type="checkbox" id="check-all"></th>
+        <th>Title</th><th>Video</th><th>Audio</th><th>Embedded subs</th><th>Sidecars</th><th class="num">Size</th><th></th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+    <div id="files-empty" class="empty" hidden>No files. Add a library and scan it.</div>
+  </section>
+
+  <section id="view-libraries" hidden>
+    <div class="toolbar">
+      <button id="btn-add-library">Add library</button>
+      <button id="btn-scan-all">Scan all</button>
+    </div>
+    <table id="libraries-table">
+      <thead><tr><th>Name</th><th>Path</th><th>Kind</th><th>Hardlink policy</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div id="libraries-empty" class="empty" hidden>
+      No libraries yet. Add your media roots (the same paths Sonarr/Radarr write to).
+    </div>
+  </section>
+
+  <section id="view-jobs" hidden>
+    <table id="jobs-table">
+      <thead><tr><th>#</th><th>Type</th><th>File</th><th>Status</th><th class="num">Saved</th><th>Log</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div id="jobs-empty" class="empty" hidden>No jobs yet.</div>
+  </section>
+</main>
+
+<dialog id="dlg-file">
+  <h2 id="dlg-file-title"></h2>
+  <p id="dlg-file-path" class="muted"></p>
+  <form method="dialog" id="dlg-file-form">
+    <h3>Streams</h3>
+    <div id="dlg-streams"></div>
+    <h3>Sidecar subtitles</h3>
+    <div id="dlg-sidecars"></div>
+    <label class="checkline"><input type="checkbox" id="dlg-allow-hardlink"> Allow remux of hardlinked file (breaks seeding links)</label>
+    <div id="dlg-preview" class="preview" hidden></div>
+    <div class="dialog-actions">
+      <button value="cancel" formnovalidate>Close</button>
+      <span class="spacer"></span>
+      <button type="button" id="dlg-dryrun">Preview</button>
+      <button type="button" id="dlg-submit" class="danger">Queue removal</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-library">
+  <h2 id="dlg-library-title">Add library</h2>
+  <form method="dialog" id="dlg-library-form">
+    <label>Name <input name="name" placeholder="TV"></label>
+    <label>Path <input name="path" required placeholder="/tv"></label>
+    <label>Kind
+      <select name="kind"><option value="tv">TV</option><option value="movie">Movies</option><option value="other">Other</option></select>
+    </label>
+    <label>Hardlink policy
+      <select name="hardlink_policy">
+        <option value="skip">Skip hardlinked files (safe while seeding)</option>
+        <option value="proceed">Proceed (breaks seed hardlinks)</option>
+      </select>
+    </label>
+    <div class="dialog-actions">
+      <button value="cancel" formnovalidate>Cancel</button>
+      <span class="spacer"></span>
+      <button type="submit" id="dlg-library-save">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-batch">
+  <h2>Batch action</h2>
+  <p class="muted"><span id="batch-count"></span> file(s) selected. Language codes as stored in the container (eng, jpn, und...). Comma-separated.</p>
+  <form method="dialog" id="dlg-batch-form">
+    <fieldset>
+      <legend>Audio tracks</legend>
+      <label>Keep only languages <input name="keep_audio_langs" placeholder="eng, jpn"></label>
+      <div class="or">or</div>
+      <label>Remove languages <input name="remove_audio_langs" placeholder="fre, ger"></label>
+      <p class="muted small">A file is never left without audio; removals emptying a file's audio are skipped.</p>
+    </fieldset>
+    <fieldset>
+      <legend>Embedded subtitles</legend>
+      <label class="checkline"><input type="checkbox" name="remove_all_subs"> Remove all embedded subtitles</label>
+      <label>Remove languages <input name="remove_sub_langs" placeholder="spa, por"></label>
+    </fieldset>
+    <fieldset>
+      <legend>Sidecar subtitle files</legend>
+      <label class="checkline"><input type="checkbox" name="delete_all_sidecars"> Delete all sidecar subtitles</label>
+      <label>Delete languages <input name="delete_sidecar_langs" placeholder="fr, de"></label>
+    </fieldset>
+    <label class="checkline"><input type="checkbox" name="allow_hardlink"> Allow remux of hardlinked files</label>
+    <div id="batch-preview" class="preview" hidden></div>
+    <div class="dialog-actions">
+      <button value="cancel" formnovalidate>Cancel</button>
+      <span class="spacer"></span>
+      <button type="button" id="batch-dryrun">Preview</button>
+      <button type="button" id="batch-submit" class="danger">Queue jobs</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toast" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>
