@@ -117,6 +117,26 @@ func (sc *Scanner) ScanLibrary(ctx context.Context, lib *store.Library) error {
 	return nil
 }
 
+// ScanFile refreshes a single file's record (probe + sidecars), used after a
+// job mutates it. A vanished file is pruned via the next full scan instead.
+func (sc *Scanner) ScanFile(ctx context.Context, lib *store.Library, path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	var siblings []string
+	for _, ent := range entries {
+		if !ent.IsDir() {
+			siblings = append(siblings, ent.Name())
+		}
+	}
+	return sc.scanOne(ctx, lib, path, info, siblings)
+}
+
 func (sc *Scanner) scanOne(ctx context.Context, lib *store.Library, path string, info fs.FileInfo, siblings []string) error {
 	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	dir := filepath.Dir(path)
