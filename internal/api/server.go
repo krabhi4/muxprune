@@ -294,7 +294,15 @@ func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	offset, _ := strconv.Atoi(q.Get("offset"))
 	files, total, err := s.Store.ListFiles(store.FileFilter{
-		LibraryID: libID, Query: q.Get("q"), Kind: q.Get("kind"), Limit: limit, Offset: offset,
+		LibraryID: libID,
+		Query:     q.Get("q"),
+		Kind:      q.Get("kind"),
+		Limit:     limit,
+		Offset:    offset,
+		Sort:      q.Get("sort"),
+		Order:     q.Get("order"),
+		Hardlinks: q.Get("hardlinks"),
+		Subs:      q.Get("subs"),
 	})
 	if err != nil {
 		writeErr(w, 500, err)

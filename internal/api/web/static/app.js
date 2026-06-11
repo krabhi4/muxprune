@@ -230,9 +230,21 @@ async function loadFiles() {
   const params = new URLSearchParams();
   const lib = $("#filter-library").value;
   const q = $("#filter-q").value.trim();
+  const kind = $("#filter-kind").value;
+  const hardlinks = $("#filter-hardlinks").value;
+  const subs = $("#filter-subs").value;
+  const sort = $("#sort-by").value;
+  const order = $("#sort-order").value;
+
   if (lib) params.set("library", lib);
   if (q) params.set("q", q);
+  if (kind) params.set("kind", kind);
+  if (hardlinks) params.set("hardlinks", hardlinks);
+  if (subs) params.set("subs", subs);
+  if (sort) params.set("sort", sort);
+  if (order) params.set("order", order);
   params.set("limit", "500");
+
   const data = await api("/files?" + params);
   filesCache = data.files;
   const tbody = $("#files-table tbody");
@@ -257,6 +269,11 @@ async function loadFiles() {
 let qTimer;
 $("#filter-q").addEventListener("input", () => { clearTimeout(qTimer); qTimer = setTimeout(loadFiles, 300); });
 $("#filter-library").addEventListener("change", loadFiles);
+$("#filter-kind").addEventListener("change", loadFiles);
+$("#filter-hardlinks").addEventListener("change", loadFiles);
+$("#filter-subs").addEventListener("change", loadFiles);
+$("#sort-by").addEventListener("change", loadFiles);
+$("#sort-order").addEventListener("change", loadFiles);
 
 $("#files-table").addEventListener("click", (e) => {
   const check = e.target.closest('input[type="checkbox"]');

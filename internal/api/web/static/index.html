@@ -29,7 +29,39 @@
   <section id="view-files">
     <div class="toolbar">
       <select id="filter-library"><option value="">All libraries</option></select>
+      <select id="filter-kind">
+        <option value="">All types</option>
+        <option value="tv">TV</option>
+        <option value="movie">Movies</option>
+        <option value="other">Other</option>
+      </select>
+      <select id="filter-hardlinks">
+        <option value="">All links</option>
+        <option value="yes">Hardlinked</option>
+        <option value="no">Single-link</option>
+      </select>
+      <select id="filter-subs">
+        <option value="">All subtitles</option>
+        <option value="any">Any subs</option>
+        <option value="none">No subs</option>
+        <option value="embedded">Embedded subs</option>
+        <option value="none_embedded">No embedded subs</option>
+        <option value="sidecar">Sidecar subs</option>
+        <option value="none_sidecar">No sidecar subs</option>
+      </select>
       <input id="filter-q" type="search" placeholder="Search title / path...">
+      <select id="sort-by">
+        <option value="default">Sort: Default</option>
+        <option value="title">Sort: Title</option>
+        <option value="size">Sort: Size</option>
+        <option value="mtime">Sort: Date Modified</option>
+        <option value="nlink">Sort: Hardlink Count</option>
+        <option value="scanned_at">Sort: Scan Date</option>
+      </select>
+      <select id="sort-order">
+        <option value="asc">Ascending</option>
+        <option value="desc">Descending</option>
+      </select>
       <span class="spacer"></span>
       <span id="selection-info"></span>
       <button id="btn-batch" disabled>Batch action...</button>

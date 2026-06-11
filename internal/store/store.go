@@ -282,6 +282,10 @@ type FileFilter struct {
 	Kind      string
 	Limit     int
 	Offset    int
+	Sort      string
+	Order     string
+	Hardlinks string
+	Subs      string
 }
 
 func (s *Store) ListFiles(f FileFilter) ([]MediaFile, int, error) {
@@ -300,6 +304,27 @@ func (s *Store) ListFiles(f FileFilter) ([]MediaFile, int, error) {
 		q := "%" + f.Query + "%"
 		args = append(args, q, q, q)
 	}
+	if f.Hardlinks == "yes" {
+		where = append(where, "nlink > 1")
+	} else if f.Hardlinks == "no" {
+		where = append(where, "nlink = 1")
+	}
+
+	switch f.Subs {
+	case "embedded":
+		where = append(where, "sub_summary != ''")
+	case "none_embedded":
+		where = append(where, "sub_summary = ''")
+	case "sidecar":
+		where = append(where, "sidecar_summary != ''")
+	case "none_sidecar":
+		where = append(where, "sidecar_summary = ''")
+	case "any":
+		where = append(where, "(sub_summary != '' OR sidecar_summary != '')")
+	case "none":
+		where = append(where, "(sub_summary = '' AND sidecar_summary = '')")
+	}
+
 	cond := strings.Join(where, " AND ")
 
 	var total int
@@ -309,9 +334,38 @@ func (s *Store) ListFiles(f FileFilter) ([]MediaFile, int, error) {
 	if f.Limit <= 0 || f.Limit > 500 {
 		f.Limit = 200
 	}
+
+	// Dynamic sorting with whitelisting
+	var orderBy string
+	switch f.Sort {
+	case "size":
+		orderBy = "size"
+	case "mtime":
+		orderBy = "mtime"
+	case "nlink":
+		orderBy = "nlink"
+	case "scanned_at":
+		orderBy = "scanned_at"
+	case "title":
+		orderBy = "title"
+	default:
+		orderBy = "series,season,episode,title,path"
+	}
+
+	orderDir := "ASC"
+	if strings.ToLower(f.Order) == "desc" {
+		orderDir = "DESC"
+	}
+
+	parts := strings.Split(orderBy, ",")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i]) + " " + orderDir
+	}
+	sortClause := strings.Join(parts, ", ")
+
 	rows, err := s.db.Query(`SELECT id,library_id,path,size,mtime,nlink,kind,series,season,episode,title,
 		video_codec,audio_summary,sub_summary,sidecar_summary
-		FROM media_files WHERE `+cond+` ORDER BY series,season,episode,title,path LIMIT ? OFFSET ?`,
+		FROM media_files WHERE `+cond+` ORDER BY `+sortClause+` LIMIT ? OFFSET ?`,
 		append(args, f.Limit, f.Offset)...)
 	if err != nil {
 		return nil, 0, err
