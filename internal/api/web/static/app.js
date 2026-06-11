@@ -128,6 +128,69 @@ function openLibraryDialog(lib) {
 }
 
 $("#btn-add-library").addEventListener("click", () => openLibraryDialog(null));
+
+// ---- folder browser ----
+let currentBrowsePath = "/";
+let parentBrowsePath = "";
+
+async function loadBrowseDirectory(path) {
+  try {
+    const res = await api("/browse?path=" + encodeURIComponent(path));
+    currentBrowsePath = res.current;
+    parentBrowsePath = res.parent;
+
+    $("#browse-path").textContent = res.current;
+    $("#browse-back").disabled = !res.parent;
+
+    const list = $("#browse-list");
+    list.innerHTML = "";
+
+    if (res.directories && res.directories.length > 0) {
+      list.innerHTML = res.directories.map(dir => `
+        <div class="browse-item" data-name="${esc(dir)}">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="var(--accent)" style="display: block; margin-top: 1px;"><path d="M2 2a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2H9L7.5 2H2z"/></svg>
+          <span>${esc(dir)}</span>
+        </div>
+      `).join("");
+    } else {
+      list.innerHTML = '<div style="padding: 1.5rem; color: var(--faint); text-align: center; font-size: 13px;">Empty directory</div>';
+    }
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+$("#btn-browse-path").addEventListener("click", () => {
+  const startingPath = $("#library-path").value.trim() || "/";
+  loadBrowseDirectory(startingPath);
+  $("#dlg-browse").showModal();
+});
+
+$("#btn-browse-cancel").addEventListener("click", () => {
+  $("#dlg-browse").close();
+});
+
+$("#btn-browse-select").addEventListener("click", () => {
+  $("#library-path").value = currentBrowsePath;
+  $("#dlg-browse").close();
+});
+
+$("#browse-back").addEventListener("click", () => {
+  if (parentBrowsePath) {
+    loadBrowseDirectory(parentBrowsePath);
+  }
+});
+
+$("#browse-list").addEventListener("click", (e) => {
+  const item = e.target.closest(".browse-item");
+  if (item) {
+    const dirName = item.dataset.name;
+    const separator = currentBrowsePath === "/" ? "" : "/";
+    const nextPath = currentBrowsePath + separator + dirName;
+    loadBrowseDirectory(nextPath);
+  }
+});
+
 $("#btn-scan-all").addEventListener("click", async () => {
   try {
     const r = await api("/scan", { method: "POST" });

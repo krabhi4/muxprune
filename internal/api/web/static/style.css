@@ -182,3 +182,59 @@ legend { color: var(--muted); font: 600 11px var(--sans); text-transform: upperc
   max-width: 420px;
 }
 #toast.error { border-left-color: var(--red); color: #e0b1aa; }
+
+/* ---- folder browser ---- */
+#dlg-browse {
+  width: 480px;
+  max-width: 90%;
+}
+.browse-current {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  padding: 6px 8px;
+  border-radius: 3px;
+  margin-bottom: 12px;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+.browse-list {
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bg);
+  height: 250px;
+  overflow-y: auto;
+  margin-bottom: 16px;
+}
+.browse-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border-soft);
+  user-select: none;
+}
+.browse-item:hover {
+  background: var(--panel2);
+}
+.browse-item svg {
+  fill: var(--accent);
+}
+.btn-icon {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+}
+.btn-icon:hover {
+  color: var(--text);
+}
+

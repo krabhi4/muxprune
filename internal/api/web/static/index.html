@@ -91,7 +91,12 @@
   <h2 id="dlg-library-title">Add library</h2>
   <form method="dialog" id="dlg-library-form">
     <label>Name <input name="name" placeholder="TV"></label>
-    <label>Path <input name="path" required placeholder="/tv"></label>
+    <label>Path
+      <div style="display: flex; gap: 6px; align-items: center;">
+        <input name="path" id="library-path" required placeholder="/tv" style="flex: 1; margin-top: 0.2rem;">
+        <button type="button" id="btn-browse-path" style="margin-top: 0.2rem; height: 32px; display: flex; align-items: center; justify-content: center;">Browse...</button>
+      </div>
+    </label>
     <label>Kind
       <select name="kind"><option value="tv">TV</option><option value="movie">Movies</option><option value="other">Other</option></select>
     </label>
@@ -108,6 +113,21 @@
     </div>
   </form>
 </dialog>
+
+<dialog id="dlg-browse">
+  <h2>Browse Folder</h2>
+  <div class="browse-current">
+    <button type="button" id="browse-back" class="btn-icon" title="Go up one folder">&#11164;</button>
+    <span id="browse-path" style="flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">/</span>
+  </div>
+  <div id="browse-list" class="browse-list"></div>
+  <div class="dialog-actions">
+    <button type="button" id="btn-browse-cancel">Cancel</button>
+    <span class="spacer"></span>
+    <button type="button" id="btn-browse-select" class="primary">Select</button>
+  </div>
+</dialog>
+
 
 <dialog id="dlg-batch">
   <h2>Batch action</h2>

@@ -49,6 +49,7 @@ func (s *Server) Handler() http.Handler {
 		})
 	})
 	mux.HandleFunc("GET /api/v1/stats", s.handleStats)
+	mux.HandleFunc("GET /api/v1/browse", s.handleBrowse)
 
 	mux.HandleFunc("GET /api/v1/libraries", s.handleListLibraries)
 	mux.HandleFunc("POST /api/v1/libraries", s.handleAddLibrary)
@@ -113,6 +114,39 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, st)
+}
+
+func (s *Server) handleBrowse(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		path = "/"
+	}
+	path = filepath.Clean(path)
+
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+
+	var dirs []string
+	for _, entry := range entries {
+		if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
+			dirs = append(dirs, entry.Name())
+		}
+	}
+	slices.Sort(dirs)
+
+	parent := filepath.Dir(path)
+	if parent == path {
+		parent = ""
+	}
+
+	writeJSON(w, 200, map[string]any{
+		"current":     path,
+		"parent":      parent,
+		"directories": dirs,
+	})
 }
 
 func (s *Server) handleListLibraries(w http.ResponseWriter, r *http.Request) {
