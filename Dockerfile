@@ -10,7 +10,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
     -o /muxprune ./cmd/muxprune
 
-FROM alpine:3.21
+FROM alpine:3.24
 RUN apk add --no-cache ffmpeg mkvtoolnix tzdata su-exec
 COPY --from=build /muxprune /usr/local/bin/muxprune
 COPY entrypoint.sh /entrypoint.sh
