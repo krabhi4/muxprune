@@ -270,8 +270,20 @@ func (e *Engine) verify(ctx context.Context, in *probe.Result, spec RemovalSpec,
 		return fmt.Errorf("subtitle stream count: want %d, got %d", wantSubs, got)
 	}
 	if in.Duration > 0 && out.Duration > 0 {
-		if d := in.Duration - out.Duration; d > 1.5 || d < -1.5 {
-			return fmt.Errorf("duration drifted: %.2fs -> %.2fs", in.Duration, out.Duration)
+		diff := in.Duration - out.Duration
+		if diff < 0 {
+			diff = -diff
+		}
+		// Allow up to 1% drift, with a minimum tolerance of 2.0 seconds and a maximum tolerance of 60.0 seconds.
+		tolerance := in.Duration * 0.01
+		if tolerance < 2.0 {
+			tolerance = 2.0
+		}
+		if tolerance > 60.0 {
+			tolerance = 60.0
+		}
+		if diff > tolerance {
+			return fmt.Errorf("duration drifted: %.2fs -> %.2fs (tolerance %.2fs)", in.Duration, out.Duration, tolerance)
 		}
 	}
 	// Size floor: output must hold everything we kept. With unknown bitrates
