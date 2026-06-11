@@ -1,0 +1,14 @@
+# runtime data
+/data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# build artifacts
+/muxprune
+/dist/
+*.test
+
+# OS noise
+.DS_Store

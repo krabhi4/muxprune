@@ -1,0 +1,404 @@
+// Package engine performs the destructive operations: lossless track removal
+// via container remux, and sidecar subtitle deletion. Every remux goes through
+// the same safety pipeline: guardrails, hardlink policy, free-space check,
+// write to a temp file in the same directory, verify the output, preserve file
+// attributes, then atomically rename over the original.
+package engine
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/krabhi4/muxprune/internal/probe"
+)
+
+// ErrSkipped marks a job that was refused by policy (not a failure).
+var ErrSkipped = errors.New("skipped by policy")
+
+type RemovalSpec struct {
+	AudioIdx []int `json:"audio_idx"` // ffprobe stream indexes to remove
+	SubIdx   []int `json:"sub_idx"`
+}
+
+func (r RemovalSpec) Empty() bool { return len(r.AudioIdx) == 0 && len(r.SubIdx) == 0 }
+
+type Options struct {
+	AllowHardlink  bool `json:"allow_hardlink"`
+	AllowLastAudio bool `json:"allow_last_audio"`
+	DryRun         bool `json:"dry_run"`
+}
+
+type Result struct {
+	Tool       string `json:"tool"`
+	Command    string `json:"command"`
+	BytesSaved int64  `json:"bytes_saved"`
+	DryRun     bool   `json:"dry_run"`
+}
+
+type Engine struct {
+	Prober     *probe.Prober
+	RecycleDir string // "" deletes sidecars permanently
+
+	once     sync.Once
+	ffmpeg   string
+	mkvmerge string
+}
+
+func (e *Engine) resolve() {
+	e.once.Do(func() {
+		e.ffmpeg, _ = exec.LookPath("ffmpeg")
+		e.mkvmerge, _ = exec.LookPath("mkvmerge")
+	})
+}
+
+// RemoveTracks losslessly remuxes path without the specified streams.
+func (e *Engine) RemoveTracks(ctx context.Context, path string, spec RemovalSpec, opts Options) (*Result, error) {
+	e.resolve()
+	if spec.Empty() {
+		return nil, errors.New("nothing to remove")
+	}
+	res, err := e.Prober.Probe(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if err := validate(res, spec, opts); err != nil {
+		return nil, err
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !opts.AllowHardlink {
+		if n := nlink(info); n > 1 {
+			return nil, fmt.Errorf("%w: file has %d hardlinks (likely still seeding); enable hardlink override to proceed", ErrSkipped, n)
+		}
+	}
+	dir := filepath.Dir(path)
+	if free, err := freeSpace(dir); err == nil && free < uint64(info.Size()) {
+		return nil, fmt.Errorf("not enough free space in %s: need %d, have %d", dir, info.Size(), free)
+	}
+
+	tool, args, err := e.buildArgs(res, spec)
+	if err != nil {
+		return nil, err
+	}
+	ext := filepath.Ext(path)
+	base := strings.TrimSuffix(filepath.Base(path), ext)
+	tmp := filepath.Join(dir, "."+base+".muxprune.tmp"+ext)
+	cmdline := tool + " " + strings.Join(args, " ")
+
+	if opts.DryRun {
+		return &Result{Tool: filepath.Base(tool), Command: cmdline, DryRun: true,
+			BytesSaved: estimateRemoved(res, spec)}, nil
+	}
+
+	defer os.Remove(tmp) // no-op after successful rename
+	full := append(slices.Clone(args), outputArgs(tool, tmp)...)
+	full = reorderOutput(tool, full, tmp)
+	cmd := exec.CommandContext(ctx, tool, full...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("%s failed: %w: %s", filepath.Base(tool), err, tail(stderr.String(), 1000))
+	}
+
+	if err := e.verify(ctx, res, spec, tmp); err != nil {
+		return nil, fmt.Errorf("output verification failed, original untouched: %w", err)
+	}
+
+	outInfo, err := os.Stat(tmp)
+	if err != nil {
+		return nil, err
+	}
+	preserveAttrs(tmp, info)
+	if err := os.Rename(tmp, path); err != nil {
+		return nil, fmt.Errorf("atomic rename: %w", err)
+	}
+	return &Result{
+		Tool: filepath.Base(tool), Command: cmdline,
+		BytesSaved: info.Size() - outInfo.Size(),
+	}, nil
+}
+
+func validate(res *probe.Result, spec RemovalSpec, opts Options) error {
+	byIdx := map[int]probe.Stream{}
+	for _, s := range res.Streams {
+		byIdx[s.Index] = s
+	}
+	for _, i := range spec.AudioIdx {
+		s, ok := byIdx[i]
+		if !ok || s.Type != "audio" {
+			return fmt.Errorf("stream %d is not an audio stream", i)
+		}
+	}
+	for _, i := range spec.SubIdx {
+		s, ok := byIdx[i]
+		if !ok || s.Type != "subtitle" {
+			return fmt.Errorf("stream %d is not a subtitle stream", i)
+		}
+	}
+	audio := res.StreamsOfType("audio")
+	if len(spec.AudioIdx) >= len(audio) && len(audio) > 0 && !opts.AllowLastAudio {
+		return errors.New("refusing to remove the last audio track (override available)")
+	}
+	if len(res.StreamsOfType("video")) == 0 {
+		return errors.New("no video stream found; not a video file?")
+	}
+	return nil
+}
+
+// buildArgs prefers mkvmerge for Matroska (fastest, most correct); falls back
+// to ffmpeg negative mapping with stream copy.
+func (e *Engine) buildArgs(res *probe.Result, spec RemovalSpec) (tool string, args []string, err error) {
+	if res.IsMatroska() && e.mkvmerge != "" && mkvIDsKnown(res, spec) {
+		return e.mkvmerge, mkvmergeArgs(res, spec), nil
+	}
+	if e.ffmpeg == "" {
+		return "", nil, errors.New("no remux tool available (need mkvmerge or ffmpeg)")
+	}
+	return e.ffmpeg, ffmpegArgs(res, spec), nil
+}
+
+func mkvIDsKnown(res *probe.Result, spec RemovalSpec) bool {
+	for _, s := range res.Streams {
+		if (s.Type == "audio" || s.Type == "subtitle") && s.MkvID < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// mkvmergeArgs uses explicit keep-lists, which read unambiguously in job logs.
+func mkvmergeArgs(res *probe.Result, spec RemovalSpec) []string {
+	var args []string
+	keep := func(typ string, removed []int) []string {
+		var ids []string
+		for _, s := range res.StreamsOfType(typ) {
+			if !slices.Contains(removed, s.Index) {
+				ids = append(ids, strconv.Itoa(s.MkvID))
+			}
+		}
+		return ids
+	}
+	if len(spec.AudioIdx) > 0 {
+		if ids := keep("audio", spec.AudioIdx); len(ids) == 0 {
+			args = append(args, "--no-audio")
+		} else {
+			args = append(args, "--audio-tracks", strings.Join(ids, ","))
+		}
+	}
+	if len(spec.SubIdx) > 0 {
+		if ids := keep("subtitle", spec.SubIdx); len(ids) == 0 {
+			args = append(args, "--no-subtitles")
+		} else {
+			args = append(args, "--subtitle-tracks", strings.Join(ids, ","))
+		}
+	}
+	return append(args, res.Path)
+}
+
+func ffmpegArgs(res *probe.Result, spec RemovalSpec) []string {
+	args := []string{"-y", "-v", "error", "-i", res.Path, "-map", "0"}
+	// ffmpeg negative maps use per-type positions, not global indexes.
+	pos := func(typ string, idx int) int {
+		p := 0
+		for _, s := range res.StreamsOfType(typ) {
+			if s.Index == idx {
+				return p
+			}
+			p++
+		}
+		return -1
+	}
+	var negs []string
+	for _, i := range spec.AudioIdx {
+		negs = append(negs, fmt.Sprintf("-0:a:%d", pos("audio", i)))
+	}
+	for _, i := range spec.SubIdx {
+		negs = append(negs, fmt.Sprintf("-0:s:%d", pos("subtitle", i)))
+	}
+	sort.Strings(negs)
+	for _, n := range negs {
+		args = append(args, "-map", n)
+	}
+	return append(args, "-c", "copy")
+}
+
+// outputArgs / reorderOutput: mkvmerge wants `-o out` before the input,
+// ffmpeg wants the output last. buildArgs returns input-terminated args, so
+// fix up per tool here.
+func outputArgs(tool, tmp string) []string {
+	if strings.Contains(filepath.Base(tool), "mkvmerge") {
+		return nil
+	}
+	return []string{tmp}
+}
+
+func reorderOutput(tool string, args []string, tmp string) []string {
+	if strings.Contains(filepath.Base(tool), "mkvmerge") {
+		return append([]string{"-q", "-o", tmp}, args...)
+	}
+	return args
+}
+
+func (e *Engine) verify(ctx context.Context, in *probe.Result, spec RemovalSpec, tmp string) error {
+	out, err := e.Prober.Probe(ctx, tmp)
+	if err != nil {
+		return fmt.Errorf("probing output: %w", err)
+	}
+	wantAudio := len(in.StreamsOfType("audio")) - len(spec.AudioIdx)
+	wantSubs := len(in.StreamsOfType("subtitle")) - len(spec.SubIdx)
+	if got := len(out.StreamsOfType("video")); got != len(in.StreamsOfType("video")) {
+		return fmt.Errorf("video stream count changed: %d -> %d", len(in.StreamsOfType("video")), got)
+	}
+	if got := len(out.StreamsOfType("audio")); got != wantAudio {
+		return fmt.Errorf("audio stream count: want %d, got %d", wantAudio, got)
+	}
+	if got := len(out.StreamsOfType("subtitle")); got != wantSubs {
+		return fmt.Errorf("subtitle stream count: want %d, got %d", wantSubs, got)
+	}
+	if in.Duration > 0 && out.Duration > 0 {
+		if d := in.Duration - out.Duration; d > 1.5 || d < -1.5 {
+			return fmt.Errorf("duration drifted: %.2fs -> %.2fs", in.Duration, out.Duration)
+		}
+	}
+	// Size floor: output must hold everything we kept. With unknown bitrates
+	// fall back to a conservative 20% floor; count+duration checks above carry
+	// most of the weight.
+	floor := int64(float64(in.Size-estimateRemoved(in, spec)) * 0.7)
+	if min := in.Size / 5; floor < min && estimateRemoved(in, spec) == 0 {
+		floor = min
+	}
+	if out.Size < floor {
+		return fmt.Errorf("output suspiciously small: %d < floor %d (input %d)", out.Size, floor, in.Size)
+	}
+	return nil
+}
+
+func estimateRemoved(res *probe.Result, spec RemovalSpec) int64 {
+	var sum int64
+	removed := append(slices.Clone(spec.AudioIdx), spec.SubIdx...)
+	for _, s := range res.Streams {
+		if slices.Contains(removed, s.Index) && s.BitRate > 0 && res.Duration > 0 {
+			sum += int64(float64(s.BitRate) / 8 * res.Duration)
+		}
+	}
+	return sum
+}
+
+// DeleteSidecar removes (or recycles) an external subtitle file.
+func (e *Engine) DeleteSidecar(path string, dryRun bool) (*Result, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.IsDir() || !isSubtitlePath(path) {
+		return nil, fmt.Errorf("refusing to delete %s: not a subtitle file", path)
+	}
+	r := &Result{Tool: "fs", BytesSaved: info.Size(), DryRun: dryRun}
+	if dryRun {
+		r.Command = "delete " + path
+		return r, nil
+	}
+	if e.RecycleDir != "" {
+		if err := os.MkdirAll(e.RecycleDir, 0o755); err != nil {
+			return nil, err
+		}
+		dst := filepath.Join(e.RecycleDir,
+			time.Now().UTC().Format("20060102-150405")+"_"+filepath.Base(path))
+		if err := moveFile(path, dst); err != nil {
+			return nil, err
+		}
+		r.Command = "recycle " + path + " -> " + dst
+		return r, nil
+	}
+	if err := os.Remove(path); err != nil {
+		return nil, err
+	}
+	r.Command = "delete " + path
+	return r, nil
+}
+
+// PurgeRecycle deletes recycled files older than the given age.
+func (e *Engine) PurgeRecycle(olderThan time.Duration) (int, error) {
+	if e.RecycleDir == "" {
+		return 0, nil
+	}
+	entries, err := os.ReadDir(e.RecycleDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	n := 0
+	cutoff := time.Now().Add(-olderThan)
+	for _, ent := range entries {
+		info, err := ent.Info()
+		if err != nil || info.IsDir() {
+			continue
+		}
+		if info.ModTime().Before(cutoff) {
+			if os.Remove(filepath.Join(e.RecycleDir, ent.Name())) == nil {
+				n++
+			}
+		}
+	}
+	return n, nil
+}
+
+var subtitleExts = map[string]bool{
+	".srt": true, ".ass": true, ".ssa": true, ".sub": true, ".idx": true,
+	".vtt": true, ".smi": true, ".sup": true,
+}
+
+func isSubtitlePath(path string) bool {
+	return subtitleExts[strings.ToLower(filepath.Ext(path))]
+}
+
+// moveFile renames, falling back to copy+delete across filesystems
+// (the recycle dir usually lives on the /config mount, not the media mount).
+func moveFile(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(dst)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(dst)
+		return err
+	}
+	return os.Remove(src)
+}
+
+func tail(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= n {
+		return s
+	}
+	return "..." + s[len(s)-n:]
+}
