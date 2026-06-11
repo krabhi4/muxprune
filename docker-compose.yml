@@ -1,0 +1,22 @@
+# Example deployment alongside an *arr stack.
+# Mount the SAME media paths Sonarr/Radarr/Bazarr write to, with the same
+# PUID/PGID, so replaced files keep their ownership.
+services:
+  muxprune:
+    image: ghcr.io/krabhi4/muxprune:latest
+    container_name: muxprune
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+      - UMASK=022
+      # - MUXPRUNE_API_KEY=changeme      # require X-Api-Key on /api/*
+      # - MUXPRUNE_WORKERS=1             # concurrent remux jobs (disk-bound, keep low)
+      # - MUXPRUNE_RECYCLE_DAYS=7        # deleted sidecars kept in /config/recycle; 0 = delete permanently
+    volumes:
+      - ./config:/config
+      - /data/media/tv:/tv
+      - /data/media/movies:/movies
+    ports:
+      - "8484:8484"
+    restart: unless-stopped
