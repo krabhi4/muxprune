@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Incremental library scanning and media files cataloging with hardlink safety detection.
 - SQLite-backed asynchronous job queue and single-threaded worker manager.
 - REST API and embedded Web UI for browsing media inventory, inspecting tracks, and queuing strip jobs.
+- Interactive, server-side folder browser in the Web UI for selecting library paths instead of typing them.
 - Docker multi-arch support (`linux/amd64`, `linux/arm64`) with user ID mapping (`PUID`/`PGID`) and integrated health checks.
 - Dependabot config to auto-group minor/patch dependency upgrades for Go, Docker, and GitHub Actions.
 - Robust CI/CD workflows for automated linting (golangci-lint, hadolint, govulncheck), tests, and GHCR package publishing.
