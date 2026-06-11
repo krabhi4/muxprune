@@ -9,6 +9,34 @@ permissions:
   contents: read
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check Go formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Run govulncheck
+        uses: golang/govulncheck-action@v1
+
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          ignore: DL3018
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -16,12 +44,43 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-          # caches both the module download dir and the Go build cache,
-          # keyed on go.sum; subsequent runs skip recompiling dependencies
           cache: true
+
       - name: Install media tools for integration tests
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg mkvtoolnix
-      - run: go vet ./...
-      - run: go test ./...
-      - name: Verify CGO-free static build
-        run: CGO_ENABLED=0 go build ./cmd/muxprune
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg mkvtoolnix
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Go test
+        run: go test -v -race ./...
+
+      - name: Go test (CGO disabled)
+        run: CGO_ENABLED=0 go test -v ./...
+
+      - name: Verify static build compilation
+        run: CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" ./cmd/muxprune
+
+  docker-dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build Docker image (dry run)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          build-args: |
+            VERSION=ci-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

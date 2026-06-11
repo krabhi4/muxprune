@@ -4,6 +4,11 @@
 # when not started as root (e.g. docker run --user).
 set -e
 
+# If the command starts with a flag (e.g. -port) or is empty, default to "serve"
+if [ "$#" -eq 0 ] || [ "${1#-}" != "$1" ]; then
+    set -- serve "$@"
+fi
+
 if [ "$(id -u)" = "0" ]; then
     PUID="${PUID:-1000}"
     PGID="${PGID:-1000}"
@@ -18,7 +23,24 @@ if [ "$(id -u)" = "0" ]; then
     fi
     mkdir -p "${MUXPRUNE_CONFIG:-/config}"
     chown "$PUID:$PGID" "${MUXPRUNE_CONFIG:-/config}"
-    exec su-exec "$PUID:$PGID" muxprune serve "$@"
+
+    # If the subcommand is a known muxprune command, run it under su-exec
+    case "$1" in
+        serve|inspect|strip|version)
+            exec su-exec "$PUID:$PGID" muxprune "$@"
+            ;;
+        *)
+            # Otherwise execute the custom command directly (e.g. /bin/sh)
+            exec su-exec "$PUID:$PGID" "$@"
+            ;;
+    esac
 fi
 
-exec muxprune serve "$@"
+case "$1" in
+    serve|inspect|strip|version)
+        exec muxprune "$@"
+        ;;
+    *)
+        exec "$@"
+        ;;
+esac

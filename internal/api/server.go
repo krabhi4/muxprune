@@ -415,11 +415,11 @@ func (s *Server) enqueueForFile(d *fileDetail, req fileJobRequest) ([]*store.Job
 
 type batchRequest struct {
 	FileIDs            []int64  `json:"file_ids"`
-	RemoveAudioLangs   []string `json:"remove_audio_langs"`    // langs to REMOVE
-	KeepAudioLangs     []string `json:"keep_audio_langs"`      // alternative: langs to KEEP (others removed)
-	RemoveSubLangs     []string `json:"remove_sub_langs"`      // embedded
-	RemoveAllSubs      bool     `json:"remove_all_subs"`       // embedded
-	DeleteSidecarLangs []string `json:"delete_sidecar_langs"`  // sidecar files
+	RemoveAudioLangs   []string `json:"remove_audio_langs"`   // langs to REMOVE
+	KeepAudioLangs     []string `json:"keep_audio_langs"`     // alternative: langs to KEEP (others removed)
+	RemoveSubLangs     []string `json:"remove_sub_langs"`     // embedded
+	RemoveAllSubs      bool     `json:"remove_all_subs"`      // embedded
+	DeleteSidecarLangs []string `json:"delete_sidecar_langs"` // sidecar files
 	DeleteAllSidecars  bool     `json:"delete_all_sidecars"`
 	AllowHardlink      bool     `json:"allow_hardlink"`
 	DryRun             bool     `json:"dry_run"`
