@@ -36,6 +36,9 @@ type Server struct {
 
 	scanMu  sync.Mutex
 	scanSet map[int64]bool // libraries with a scan in flight
+
+	mcpMu       sync.Mutex
+	mcpSessions map[string]chan []byte
 }
 
 func (s *Server) Handler() http.Handler {
@@ -70,6 +73,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/jobs", s.handleListJobs)
 	mux.HandleFunc("GET /api/v1/events", s.Hub.ServeSSE)
 	mux.HandleFunc("POST /api/v1/webhooks/arr", s.handleArrWebhook)
+
+	mux.HandleFunc("GET /sse", s.handleMCPSSE)
+	mux.HandleFunc("GET /api/v1/mcp/sse", s.handleMCPSSE)
+	mux.HandleFunc("POST /api/v1/mcp/message", s.handleMCPMessage)
 
 	static, _ := fs.Sub(webFS, "web/static")
 	mux.Handle("GET /", http.FileServerFS(static))

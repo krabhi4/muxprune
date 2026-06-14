@@ -3,10 +3,13 @@ package api
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 
@@ -550,4 +553,133 @@ func sendMCPToolError(w io.Writer, id *json.RawMessage, text string) {
 		},
 		"isError": true,
 	})
+}
+
+func (s *Server) handleMCPSSE(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "SSE not supported", http.StatusInternalServerError)
+		return
+	}
+
+	// Generate a unique session ID
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	sessionID := hex.EncodeToString(b)
+
+	// Set SSE headers
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	// Create and register session channel
+	ch := make(chan []byte, 100)
+	s.mcpMu.Lock()
+	if s.mcpSessions == nil {
+		s.mcpSessions = map[string]chan []byte{}
+	}
+	s.mcpSessions[sessionID] = ch
+	s.mcpMu.Unlock()
+
+	defer func() {
+		s.mcpMu.Lock()
+		delete(s.mcpSessions, sessionID)
+		s.mcpMu.Unlock()
+		close(ch)
+	}()
+
+	// Send initial endpoint event. This tells the client where to send POST messages.
+	endpoint := fmt.Sprintf("/api/v1/mcp/message?session_id=%s", sessionID)
+	_, _ = fmt.Fprintf(w, "event: endpoint\ndata: %s\n\n", endpoint)
+	flusher.Flush()
+
+	// Keep connection alive and forward messages
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case msg := <-ch:
+			_, _ = fmt.Fprintf(w, "event: message\ndata: %s\n\n", string(msg))
+			flusher.Flush()
+		}
+	}
+}
+
+func (s *Server) handleMCPMessage(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.URL.Query().Get("session_id")
+	if sessionID == "" {
+		http.Error(w, "Missing session_id", http.StatusBadRequest)
+		return
+	}
+
+	s.mcpMu.Lock()
+	ch, ok := s.mcpSessions[sessionID]
+	s.mcpMu.Unlock()
+	if !ok {
+		http.Error(w, "Session not found", http.StatusNotFound)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read body", http.StatusBadRequest)
+		return
+	}
+
+	var req jsonRPCRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		s.sendMCPSSEResponse(ch, nil, -32700, "Parse error: "+err.Error())
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if req.Method == "" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	go func() {
+		s.handleMCPSSERequest(r.Context(), ch, &req)
+	}()
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) sendMCPSSEResponse(ch chan []byte, id *json.RawMessage, code int, msg string) {
+	resp := jsonRPCResponse{
+		JSONRPC: "2.0",
+		ID:      id,
+		Error: &jsonRPCError{
+			Code:    code,
+			Message: msg,
+		},
+	}
+	b, _ := json.Marshal(resp)
+	select {
+	case ch <- b:
+	default:
+	}
+}
+
+func (s *Server) handleMCPSSERequest(ctx context.Context, ch chan []byte, req *jsonRPCRequest) {
+	w := sseWriter{ch: ch}
+	s.handleMCPRequest(ctx, w, req)
+}
+
+type sseWriter struct {
+	ch chan []byte
+}
+
+func (sw sseWriter) Write(p []byte) (n int, err error) {
+	if len(p) > 0 && p[len(p)-1] == '\n' {
+		p = p[:len(p)-1]
+	}
+	b := make([]byte, len(p))
+	copy(b, p)
+	select {
+	case sw.ch <- b:
+	default:
+	}
+	return len(p), nil
 }
