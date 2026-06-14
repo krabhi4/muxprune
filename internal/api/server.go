@@ -2,7 +2,6 @@
 package api
 
 import (
-	"context"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -33,9 +32,6 @@ type Server struct {
 	Engine  *engine.Engine
 	Hub     *Hub
 	APIKey  string // empty disables auth
-
-	scanMu  sync.Mutex
-	scanSet map[int64]bool // libraries with a scan in flight
 
 	mcpMu       sync.Mutex
 	mcpSessions map[string]chan []byte
@@ -241,29 +237,6 @@ func (s *Server) handleDeleteLibrary(w http.ResponseWriter, r *http.Request) {
 
 // ---- scanning ----
 
-func (s *Server) startScan(lib *store.Library) bool {
-	s.scanMu.Lock()
-	defer s.scanMu.Unlock()
-	if s.scanSet == nil {
-		s.scanSet = map[int64]bool{}
-	}
-	if s.scanSet[lib.ID] {
-		return false
-	}
-	s.scanSet[lib.ID] = true
-	go func() {
-		defer func() {
-			s.scanMu.Lock()
-			delete(s.scanSet, lib.ID)
-			s.scanMu.Unlock()
-		}()
-		if err := s.Scanner.ScanLibrary(context.Background(), lib); err != nil {
-			s.Hub.Notify("scan", map[string]any{"library_id": lib.ID, "phase": "error", "error": err.Error()})
-		}
-	}()
-	return true
-}
-
 func (s *Server) handleScanLibrary(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
@@ -275,26 +248,41 @@ func (s *Server) handleScanLibrary(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, errors.New("library not found"))
 		return
 	}
-	if !s.startScan(lib) {
-		writeJSON(w, 409, map[string]string{"error": "scan already running for this library"})
-		return
-	}
-	writeJSON(w, 202, map[string]bool{"started": true})
-}
-
-func (s *Server) handleScanAll(w http.ResponseWriter, r *http.Request) {
-	libs, err := s.Store.ListLibraries()
+	active, err := s.Store.IsScanActive(lib.ID)
 	if err != nil {
 		writeErr(w, 500, err)
 		return
 	}
-	started := 0
-	for i := range libs {
-		if s.startScan(&libs[i]) {
-			started++
-		}
+	if active {
+		writeJSON(w, 409, map[string]string{"error": "scan already running or queued for this library"})
+		return
 	}
-	writeJSON(w, 202, map[string]int{"started": started})
+	_, err = s.Store.CreateJob("scan_library", 0, lib.Path, jobs.ScanLibraryPayload{LibraryID: lib.ID})
+	if err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	s.Runner.Wake()
+	writeJSON(w, 202, map[string]bool{"started": true})
+}
+
+func (s *Server) handleScanAll(w http.ResponseWriter, r *http.Request) {
+	active, err := s.Store.IsScanAllActive()
+	if err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	if active {
+		writeJSON(w, 409, map[string]string{"error": "scan all already queued or running"})
+		return
+	}
+	_, err = s.Store.CreateJob("scan_all", 0, "all libraries", map[string]any{})
+	if err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	s.Runner.Wake()
+	writeJSON(w, 202, map[string]int{"started": 1})
 }
 
 // ---- files ----
@@ -820,7 +808,11 @@ func (s *Server) handleArrWebhook(w http.ResponseWriter, r *http.Request) {
 	for i := range libs {
 		if strings.HasPrefix(filepath.Clean(target)+string(filepath.Separator),
 			filepath.Clean(libs[i].Path)+string(filepath.Separator)) {
-			s.startScan(&libs[i])
+			active, _ := s.Store.IsScanActive(libs[i].ID)
+			if !active {
+				_, _ = s.Store.CreateJob("scan_library", 0, libs[i].Path, jobs.ScanLibraryPayload{LibraryID: libs[i].ID})
+				s.Runner.Wake()
+			}
 			writeJSON(w, 202, map[string]any{"library": libs[i].Name, "scan": "started"})
 			return
 		}

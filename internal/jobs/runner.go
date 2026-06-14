@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +38,10 @@ type ReorderPayload struct {
 
 type MergePayload struct {
 	ExternalFiles []string `json:"external_files"`
+}
+
+type ScanLibraryPayload struct {
+	LibraryID int64 `json:"library_id"`
 }
 
 type Runner struct {
@@ -187,6 +192,40 @@ func (r *Runner) execute(ctx context.Context, job *store.Job) (status, log strin
 		}
 		r.refreshFile(ctx, job.MediaFileID())
 		return "done", res.Tool + ": " + res.Command, res.BytesSaved
+
+	case "scan_library":
+		var p ScanLibraryPayload
+		if err := json.Unmarshal(job.Payload, &p); err != nil {
+			return "failed", "bad payload: " + err.Error(), 0
+		}
+		lib, err := r.Store.GetLibrary(p.LibraryID)
+		if err != nil {
+			return "failed", "db error: " + err.Error(), 0
+		}
+		if lib == nil {
+			return "failed", fmt.Sprintf("library %d not found", p.LibraryID), 0
+		}
+		if err := r.Scanner.ScanLibrary(ctx, lib); err != nil {
+			return "failed", err.Error(), 0
+		}
+		return "done", fmt.Sprintf("scanned library: %s", lib.Name), 0
+
+	case "scan_all":
+		libs, err := r.Store.ListLibraries()
+		if err != nil {
+			return "failed", "db error: " + err.Error(), 0
+		}
+		var scanned []string
+		for i := range libs {
+			if ctx.Err() != nil {
+				return "failed", ctx.Err().Error(), 0
+			}
+			if err := r.Scanner.ScanLibrary(ctx, &libs[i]); err != nil {
+				return "failed", fmt.Sprintf("library %s: %v", libs[i].Name, err), 0
+			}
+			scanned = append(scanned, libs[i].Name)
+		}
+		return "done", fmt.Sprintf("scanned libraries: %s", strings.Join(scanned, ", ")), 0
 
 	default:
 		return "failed", "unknown job type " + job.Type, 0

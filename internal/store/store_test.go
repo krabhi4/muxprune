@@ -176,3 +176,79 @@ func TestStore_ListFiles_FilteringAndSorting(t *testing.T) {
 		})
 	}
 }
+
+func TestStore_IsScanActive(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "muxprune-store-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "test.db")
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer s.Close()
+
+	// Initially, scan is not active
+	active, err := s.IsScanActive(1)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if active {
+		t.Error("expected scan not to be active initially")
+	}
+
+	activeAll, err := s.IsScanAllActive()
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if activeAll {
+		t.Error("expected scan all not to be active initially")
+	}
+
+	// Queue a scan library job
+	_, err = s.CreateJob("scan_library", 0, "/tmp/lib-1", map[string]any{"library_id": int64(1)})
+	if err != nil {
+		t.Fatalf("failed to create job: %v", err)
+	}
+
+	active, err = s.IsScanActive(1)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if !active {
+		t.Error("expected scan to be active for library 1")
+	}
+
+	active, err = s.IsScanActive(2)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if active {
+		t.Error("expected scan not to be active for library 2")
+	}
+
+	// Queue a scan_all job
+	_, err = s.CreateJob("scan_all", 0, "all libraries", map[string]any{})
+	if err != nil {
+		t.Fatalf("failed to create job: %v", err)
+	}
+
+	activeAll, err = s.IsScanAllActive()
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if !activeAll {
+		t.Error("expected scan all to be active")
+	}
+
+	active, err = s.IsScanActive(2)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if !active {
+		t.Error("expected scan to be active for library 2 because scan_all is active")
+	}
+}

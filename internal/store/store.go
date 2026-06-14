@@ -493,6 +493,49 @@ func nullable(id int64) any {
 	return id
 }
 
+func (s *Store) IsScanActive(libraryID int64) (bool, error) {
+	// First check if scan_all is running or queued
+	var activeScanAll int
+	err := s.db.QueryRow(`SELECT count(*) FROM jobs WHERE type='scan_all' AND status IN ('queued','running')`).Scan(&activeScanAll)
+	if err != nil {
+		return false, err
+	}
+	if activeScanAll > 0 {
+		return true, nil
+	}
+
+	// Next check if scan_library is running or queued for this library
+	rows, err := s.db.Query(`SELECT payload_json FROM jobs WHERE type='scan_library' AND status IN ('queued','running')`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var payloadStr string
+		if err := rows.Scan(&payloadStr); err != nil {
+			return false, err
+		}
+		var p struct {
+			LibraryID int64 `json:"library_id"`
+		}
+		if err := json.Unmarshal([]byte(payloadStr), &p); err == nil {
+			if p.LibraryID == libraryID {
+				return true, nil
+			}
+		}
+	}
+	return false, rows.Err()
+}
+
+func (s *Store) IsScanAllActive() (bool, error) {
+	var activeScanAll int
+	err := s.db.QueryRow(`SELECT count(*) FROM jobs WHERE type='scan_all' AND status IN ('queued','running')`).Scan(&activeScanAll)
+	if err != nil {
+		return false, err
+	}
+	return activeScanAll > 0, nil
+}
+
 // ClaimNextJob atomically moves the oldest queued job to running.
 func (s *Store) ClaimNextJob() (*Job, error) {
 	j := &Job{}
