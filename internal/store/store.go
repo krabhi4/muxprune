@@ -560,6 +560,23 @@ func (s *Store) ListJobs(status string, limit int) ([]Job, error) {
 	return out, rows.Err()
 }
 
+func (s *Store) GetJob(id int64) (*Job, error) {
+	j := &Job{}
+	var payload string
+	err := s.db.QueryRow(`SELECT id,type,media_file_id,file_path,payload_json,status,log,bytes_saved,created_at,finished_at
+		FROM jobs WHERE id=?`, id).
+		Scan(&j.ID, &j.Type, &j.FileID, &j.FilePath, &payload, &j.Status, &j.Log,
+			&j.BytesSaved, &j.CreatedAt, &j.FinishedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	j.Payload = json.RawMessage(payload)
+	return j, nil
+}
+
 func (s *Store) Stats() (map[string]int64, error) {
 	out := map[string]int64{}
 	var saved, files, queued int64

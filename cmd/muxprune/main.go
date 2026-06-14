@@ -56,10 +56,12 @@ func main() {
 		err = runInspect(args)
 	case "strip":
 		err = runStrip(args)
+	case "mcp":
+		err = runMCP(args)
 	case "version":
 		fmt.Println("muxprune", version)
 	default:
-		err = fmt.Errorf("unknown command %q (expected serve, inspect, strip, version)", cmd)
+		err = fmt.Errorf("unknown command %q (expected serve, inspect, strip, mcp, version)", cmd)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "muxprune:", err)
@@ -123,6 +125,47 @@ func runServe(args []string) error {
 		return err
 	}
 	return nil
+}
+
+func runMCP(args []string) error {
+	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
+	configDir := fs.String("config", env("MUXPRUNE_CONFIG", "./data"), "config/state directory")
+	workers := fs.Int("workers", envInt("MUXPRUNE_WORKERS", 1), "concurrent job workers")
+	recycleDays := fs.Int("recycle-days", envInt("MUXPRUNE_RECYCLE_DAYS", 7),
+		"keep deleted sidecars this many days (0 = delete permanently)")
+	fs.Parse(args)
+
+	if err := os.MkdirAll(*configDir, 0o755); err != nil {
+		return err
+	}
+	st, err := store.Open(filepath.Join(*configDir, "muxprune.db"))
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	prober := &probe.Prober{}
+	if !prober.HasFFprobe() {
+		return fmt.Errorf("ffprobe not found in PATH; install ffmpeg")
+	}
+	hub := api.NewHub()
+	eng := &engine.Engine{Prober: prober}
+	if *recycleDays > 0 {
+		eng.RecycleDir = filepath.Join(*configDir, "recycle")
+	}
+	scanner := &scan.Scanner{Store: st, Prober: prober, Events: hub}
+	runner := &jobs.Runner{Store: st, Engine: eng, Scanner: scanner, Events: hub}
+	srv := &api.Server{Store: st, Scanner: scanner, Runner: runner, Engine: eng, Hub: hub}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go runner.Start(ctx, *workers)
+	if *recycleDays > 0 {
+		go purgeLoop(ctx, eng, time.Duration(*recycleDays)*24*time.Hour)
+	}
+
+	return srv.ServeMCP(ctx)
 }
 
 func purgeLoop(ctx context.Context, eng *engine.Engine, maxAge time.Duration) {
