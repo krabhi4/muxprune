@@ -252,3 +252,71 @@ func TestStore_IsScanActive(t *testing.T) {
 		t.Error("expected scan to be active for library 2 because scan_all is active")
 	}
 }
+
+func TestStore_CancelJob(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "muxprune-store-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "test.db")
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer s.Close()
+
+	// 1. Create a queued job
+	job, err := s.CreateJob("scan_all", 0, "all libraries", map[string]any{})
+	if err != nil {
+		t.Fatalf("failed to create job: %v", err)
+	}
+
+	// Verify status is queued
+	j1, err := s.GetJob(job.ID)
+	if err != nil || j1 == nil {
+		t.Fatalf("failed to get job: %v", err)
+	}
+	if j1.Status != "queued" {
+		t.Errorf("expected status 'queued', got %q", j1.Status)
+	}
+
+	// 2. Cancel the job
+	err = s.CancelJob(job.ID)
+	if err != nil {
+		t.Fatalf("failed to cancel job: %v", err)
+	}
+
+	// Verify status is failed and log is cancelled
+	j2, err := s.GetJob(job.ID)
+	if err != nil || j2 == nil {
+		t.Fatalf("failed to get job: %v", err)
+	}
+	if j2.Status != "failed" {
+		t.Errorf("expected status 'failed', got %q", j2.Status)
+	}
+	if j2.Log != "cancelled by user" {
+		t.Errorf("expected log 'cancelled by user', got %q", j2.Log)
+	}
+
+	// 3. Trying to cancel again should fail
+	err = s.CancelJob(job.ID)
+	if err == nil {
+		t.Error("expected error when cancelling an already cancelled job")
+	}
+
+	// 4. Try to cancel a running job (should fail)
+	job2, err := s.CreateJob("scan_all", 0, "all libraries", map[string]any{})
+	if err != nil {
+		t.Fatalf("failed to create job2: %v", err)
+	}
+	_, err = s.ClaimNextJob() // moves job2 to running
+	if err != nil {
+		t.Fatalf("failed to claim job: %v", err)
+	}
+	err = s.CancelJob(job2.ID)
+	if err == nil {
+		t.Error("expected error when trying to cancel a running job")
+	}
+}

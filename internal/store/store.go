@@ -561,6 +561,21 @@ func (s *Store) FinishJob(id int64, status, log string, bytesSaved int64) error 
 	return err
 }
 
+func (s *Store) CancelJob(id int64) error {
+	res, err := s.db.Exec(`UPDATE jobs SET status='failed', log='cancelled by user', finished_at=? WHERE id=? AND status='queued'`, time.Now().Unix(), id)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("job %d is not queued and cannot be cancelled", id)
+	}
+	return nil
+}
+
 // FailInterrupted marks jobs left 'running' by a previous process as failed.
 func (s *Store) FailInterrupted() (int64, error) {
 	res, err := s.db.Exec(`UPDATE jobs SET status='failed', log='interrupted by restart', finished_at=?

@@ -741,12 +741,15 @@ async function loadJobs() {
 
   const tbody = $("#jobs-table tbody");
   tbody.innerHTML = data.jobs.map((j) => `
-    <tr>
+    <tr data-id="${j.id}">
       <td>${j.id}</td><td>${esc(j.type)}</td>
       <td class="sub">${esc(j.file_path)}</td>
       <td><span class="status ${esc(j.status)}">${esc(j.status)}</span></td>
       <td class="num">${j.bytes_saved ? human(j.bytes_saved) : ""}</td>
       <td class="sub">${esc(j.log)}</td>
+      <td class="num">
+        ${j.status === "queued" ? `<button data-act="cancel">Cancel</button>` : ""}
+      </td>
     </tr>`).join("");
   $("#jobs-empty").hidden = data.jobs.length > 0;
 
@@ -761,6 +764,21 @@ async function loadJobs() {
   $("#btn-jobs-next").disabled = state.jobsPage >= totalPages;
 }
 $("#jobs-table").style.cursor = "default";
+$("#jobs-table").addEventListener("click", async (e) => {
+  const btn = e.target.closest("button");
+  if (!btn) return;
+  const id = +btn.closest("tr").dataset.id;
+  if (btn.dataset.act === "cancel") {
+    if (!confirm(`Cancel job #${id}?`)) return;
+    try {
+      await api(`/jobs/${id}/cancel`, { method: "POST" });
+      toast(`Job #${id} cancelled`);
+      loadJobs();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  }
+});
 
 $("#filter-job-status").addEventListener("change", () => {
   syncStateFromInputs();
