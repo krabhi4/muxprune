@@ -555,10 +555,22 @@ $("#batch-submit").addEventListener("click", async () => {
 });
 
 // ---- jobs ----
+let jobsPage = 1;
+const jobsLimit = 50;
+let jobsTotal = 0;
+
 async function loadJobs() {
-  const jobs = await api("/jobs?limit=200");
+  const params = new URLSearchParams();
+  const status = $("#filter-job-status").value;
+  if (status) params.set("status", status);
+  params.set("limit", String(jobsLimit));
+  params.set("offset", String((jobsPage - 1) * jobsLimit));
+
+  const data = await api("/jobs?" + params);
+  jobsTotal = data.total;
+
   const tbody = $("#jobs-table tbody");
-  tbody.innerHTML = jobs.map((j) => `
+  tbody.innerHTML = data.jobs.map((j) => `
     <tr>
       <td>${j.id}</td><td>${esc(j.type)}</td>
       <td class="sub">${esc(j.file_path)}</td>
@@ -566,9 +578,33 @@ async function loadJobs() {
       <td class="num">${j.bytes_saved ? human(j.bytes_saved) : ""}</td>
       <td class="sub">${esc(j.log)}</td>
     </tr>`).join("");
-  $("#jobs-empty").hidden = jobs.length > 0;
+  $("#jobs-empty").hidden = data.jobs.length > 0;
+
+  const totalPages = Math.ceil(jobsTotal / jobsLimit) || 1;
+  if (jobsPage > totalPages) jobsPage = totalPages;
+  $("#jobs-page-info").textContent = `Page ${jobsPage} of ${totalPages} (${jobsTotal} total)`;
+  $("#btn-jobs-prev").disabled = jobsPage <= 1;
+  $("#btn-jobs-next").disabled = jobsPage >= totalPages;
 }
 $("#jobs-table").style.cursor = "default";
+
+$("#filter-job-status").addEventListener("change", () => {
+  jobsPage = 1;
+  loadJobs();
+});
+$("#btn-jobs-prev").addEventListener("click", () => {
+  if (jobsPage > 1) {
+    jobsPage--;
+    loadJobs();
+  }
+});
+$("#btn-jobs-next").addEventListener("click", () => {
+  const totalPages = Math.ceil(jobsTotal / jobsLimit) || 1;
+  if (jobsPage < totalPages) {
+    jobsPage++;
+    loadJobs();
+  }
+});
 
 // ---- live events ----
 function connectEvents() {

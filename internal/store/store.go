@@ -528,10 +528,26 @@ func (s *Store) FailInterrupted() (int64, error) {
 	return res.RowsAffected()
 }
 
-func (s *Store) ListJobs(status string, limit int) ([]Job, error) {
+func (s *Store) ListJobs(status string, limit, offset int) ([]Job, int, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	countQuery := `SELECT count(*) FROM jobs`
+	var countArgs []any
+	if status != "" {
+		countQuery += ` WHERE status=?`
+		countArgs = append(countArgs, status)
+	}
+
+	var total int
+	if err := s.db.QueryRow(countQuery, countArgs...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
 	q := `SELECT id,type,media_file_id,file_path,payload_json,status,log,bytes_saved,created_at,finished_at
 		FROM jobs`
 	var args []any
@@ -539,11 +555,11 @@ func (s *Store) ListJobs(status string, limit int) ([]Job, error) {
 		q += ` WHERE status=?`
 		args = append(args, status)
 	}
-	q += ` ORDER BY id DESC LIMIT ?`
-	args = append(args, limit)
+	q += ` ORDER BY id DESC LIMIT ? OFFSET ?`
+	args = append(args, limit, offset)
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer rows.Close()
 	var out []Job
@@ -552,12 +568,12 @@ func (s *Store) ListJobs(status string, limit int) ([]Job, error) {
 		var payload string
 		if err := rows.Scan(&j.ID, &j.Type, &j.FileID, &j.FilePath, &payload, &j.Status, &j.Log,
 			&j.BytesSaved, &j.CreatedAt, &j.FinishedAt); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		j.Payload = json.RawMessage(payload)
 		out = append(out, j)
 	}
-	return out, rows.Err()
+	return out, total, rows.Err()
 }
 
 func (s *Store) GetJob(id int64) (*Job, error) {

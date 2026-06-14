@@ -92,6 +92,20 @@
   </section>
 
   <section id="view-jobs" hidden>
+    <div class="toolbar">
+      <select id="filter-job-status">
+        <option value="">All statuses</option>
+        <option value="queued">Queued</option>
+        <option value="running">Running</option>
+        <option value="done">Done</option>
+        <option value="failed">Failed</option>
+        <option value="skipped">Skipped</option>
+      </select>
+      <span class="spacer"></span>
+      <button id="btn-jobs-prev" disabled>Previous</button>
+      <span id="jobs-page-info" style="font-size: 13px; color: var(--fg);">Page 1</span>
+      <button id="btn-jobs-next" disabled>Next</button>
+    </div>
     <table id="jobs-table">
       <thead><tr><th>#</th><th>Type</th><th>File</th><th>Status</th><th class="num">Saved</th><th>Log</th></tr></thead>
       <tbody></tbody>
