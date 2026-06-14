@@ -563,6 +563,10 @@ func ffmpegArgs(res *probe.Result, spec RemovalSpec) []string {
 	for _, n := range negs {
 		args = append(args, "-map", n)
 	}
+	ext := strings.ToLower(filepath.Ext(res.Path))
+	if ext == ".m4v" || ext == ".mp4" {
+		return append(args, "-c", "copy", "-f", "mp4")
+	}
 	return append(args, "-c", "copy")
 }
 
