@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-06-15
+
+### Fixed
+- Forced ffmpeg to use the `mp4` muxer instead of `ipod` for `.m4v` and `.mp4` containers, preventing remux failures on HEVC video streams and non-standard data streams (e.g. `bin_data` with `text` tags).
+
 ## [0.3.0] - 2026-06-15
 
 ### Added
