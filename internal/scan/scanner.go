@@ -58,7 +58,7 @@ func (sc *Scanner) ScanLibrary(ctx context.Context, lib *store.Library) error {
 		info fs.FileInfo
 	}
 	var videos []entry
-	dirFiles := map[string][]string{} // dir -> all file names (for sidecar matching)
+	dirFiles := map[string][]string{}         // dir -> all file names (for sidecar matching)
 	dirSizes := map[string]map[string]int64{} // dir -> filename -> size
 
 	err := filepath.WalkDir(lib.Path, func(path string, d fs.DirEntry, err error) error {

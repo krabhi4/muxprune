@@ -280,4 +280,3 @@ func TestMergeTracks(t *testing.T) {
 		t.Errorf("expected 3 subtitle tracks after merge, got %d: %v", len(subLangs), subLangs)
 	}
 }
-
