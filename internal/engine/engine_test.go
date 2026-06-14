@@ -195,3 +195,89 @@ func TestDeleteSidecarRecycle(t *testing.T) {
 		t.Error("deleting a video file via sidecar path should fail")
 	}
 }
+
+func TestReorderTracks(t *testing.T) {
+	if _, err := exec.LookPath("mkvmerge"); err != nil {
+		t.Skip("mkvmerge not installed")
+	}
+	dir := t.TempDir()
+	path := makeFixture(t, dir)
+	p := &probe.Prober{}
+	e := &Engine{Prober: p}
+	ctx := context.Background()
+
+	before, err := p.Probe(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(langs(before, "audio")); got != 3 {
+		t.Fatalf("expected 3 audio streams initially, got %d", got)
+	}
+
+	// We have 6 streams total:
+	// 0: video
+	// 1: audio (eng)
+	// 2: audio (jpn)
+	// 3: audio (fre)
+	// 4: subtitle (eng)
+	// 5: subtitle (spa)
+	// Let's reorder the audio streams: fre (3), jpn (2), eng (1).
+	// Track order should contain all streams in new order.
+	order := []int{0, 3, 2, 1, 4, 5}
+	res, err := e.ReorderTracks(ctx, path, ReorderSpec{TrackOrder: order})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Tool != "mkvmerge" {
+		t.Errorf("expected tool mkvmerge, got %s", res.Tool)
+	}
+
+	after, err := p.Probe(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotLangs := langs(after, "audio")
+	expectedLangs := []string{"fre", "jpn", "eng"}
+	if len(gotLangs) != len(expectedLangs) {
+		t.Fatalf("expected %d audio tracks, got %d", len(expectedLangs), len(gotLangs))
+	}
+	for i, l := range expectedLangs {
+		if gotLangs[i] != l {
+			t.Errorf("at pos %d, expected audio lang %s, got %s", i, l, gotLangs[i])
+		}
+	}
+}
+
+func TestMergeTracks(t *testing.T) {
+	if _, err := exec.LookPath("mkvmerge"); err != nil {
+		t.Skip("mkvmerge not installed")
+	}
+	dir := t.TempDir()
+	path := makeFixture(t, dir)
+	p := &probe.Prober{}
+	e := &Engine{Prober: p}
+	ctx := context.Background()
+
+	extSub := filepath.Join(dir, "ext.srt")
+	srtContent := "1\n00:00:00,000 --> 00:00:02,000\nexternal\n"
+	os.WriteFile(extSub, []byte(srtContent), 0o644)
+
+	res, err := e.MergeTracks(ctx, path, MergeSpec{ExternalFiles: []string{extSub}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Tool != "mkvmerge" {
+		t.Errorf("expected tool mkvmerge, got %s", res.Tool)
+	}
+
+	after, err := p.Probe(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Before merge we had 2 subtitle tracks, now we should have 3.
+	subLangs := langs(after, "subtitle")
+	if len(subLangs) != 3 {
+		t.Errorf("expected 3 subtitle tracks after merge, got %d: %v", len(subLangs), subLangs)
+	}
+}
+

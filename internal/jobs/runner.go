@@ -27,6 +27,18 @@ type SidecarPayload struct {
 	Path      string `json:"path"`
 }
 
+type EditMetadataPayload struct {
+	Edits []engine.MetadataEdit `json:"edits"`
+}
+
+type ReorderPayload struct {
+	TrackOrder []int `json:"track_order"`
+}
+
+type MergePayload struct {
+	ExternalFiles []string `json:"external_files"`
+}
+
 type Runner struct {
 	Store   *store.Store
 	Engine  *engine.Engine
@@ -139,6 +151,42 @@ func (r *Runner) execute(ctx context.Context, job *store.Job) (status, log strin
 		}
 		r.refreshFile(ctx, job.MediaFileID())
 		return "done", res.Command, res.BytesSaved
+
+	case "edit_metadata":
+		var p EditMetadataPayload
+		if err := json.Unmarshal(job.Payload, &p); err != nil {
+			return "failed", "bad payload: " + err.Error(), 0
+		}
+		res, err := r.Engine.EditMetadata(ctx, job.FilePath, p.Edits)
+		if err != nil {
+			return "failed", err.Error(), 0
+		}
+		r.refreshFile(ctx, job.MediaFileID())
+		return "done", res.Tool + ": " + res.Command, res.BytesSaved
+
+	case "reorder_tracks":
+		var p ReorderPayload
+		if err := json.Unmarshal(job.Payload, &p); err != nil {
+			return "failed", "bad payload: " + err.Error(), 0
+		}
+		res, err := r.Engine.ReorderTracks(ctx, job.FilePath, engine.ReorderSpec{TrackOrder: p.TrackOrder})
+		if err != nil {
+			return "failed", err.Error(), 0
+		}
+		r.refreshFile(ctx, job.MediaFileID())
+		return "done", res.Tool + ": " + res.Command, res.BytesSaved
+
+	case "merge_tracks":
+		var p MergePayload
+		if err := json.Unmarshal(job.Payload, &p); err != nil {
+			return "failed", "bad payload: " + err.Error(), 0
+		}
+		res, err := r.Engine.MergeTracks(ctx, job.FilePath, engine.MergeSpec{ExternalFiles: p.ExternalFiles})
+		if err != nil {
+			return "failed", err.Error(), 0
+		}
+		r.refreshFile(ctx, job.MediaFileID())
+		return "done", res.Tool + ": " + res.Command, res.BytesSaved
 
 	default:
 		return "failed", "unknown job type " + job.Type, 0

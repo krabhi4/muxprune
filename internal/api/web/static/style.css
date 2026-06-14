@@ -75,6 +75,8 @@ button:hover:not(:disabled) { background: var(--raise); border-color: var(--fain
 button:disabled { opacity: .4; cursor: default; }
 button.danger { color: #e0b1aa; border-color: #553831; background: #2a1d19; }
 button.danger:hover:not(:disabled) { border-color: var(--red); background: #33231e; }
+button.primary { color: #11130c; background: var(--accent); border-color: var(--accent-dim); }
+button.primary:hover:not(:disabled) { background: #b8cc63; }
 #filter-q { min-width: 280px; }
 
 /* ---- tables ---- */

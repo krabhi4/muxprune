@@ -308,16 +308,104 @@ async function openFileDialog(id) {
   $("#dlg-file-title").textContent = fileLabel(dlgFile);
   $("#dlg-file-path").textContent =
     `${dlgFile.path} (${human(dlgFile.size)})` + (dlgFile.nlink > 1 ? ` — ${dlgFile.nlink} hardlinks` : "");
+  
+  const isMKV = dlgFile.format && dlgFile.format.includes("matroska");
+  
+  // Show/hide MKV specific sections
+  $("#dlg-save-metadata").style.display = isMKV ? "inline-block" : "none";
+  $("#dlg-merge-section").style.display = isMKV ? "block" : "none";
+  $("#dlg-save-order").style.display = "none"; // hidden until a reorder happens
+  $("#dlg-merge-path").value = "";
+
   const audio = dlgFile.streams.filter((s) => s.type === "audio");
-  $("#dlg-streams").innerHTML = dlgFile.streams.map((s) => {
-    const removable = s.type === "audio" || s.type === "subtitle";
-    const detail = [s.codec, s.lang || "und", s.channel_layout,
-      s.default ? "default" : "", s.forced ? "forced" : "", s.title].filter(Boolean).join(" · ");
-    return `<div class="stream-row ${removable ? "" : "locked"}">
-      <input type="checkbox" data-idx="${s.index}" data-type="${s.type}" ${removable ? "" : "disabled"}>
-      <span class="tag">#${s.index} ${esc(s.type)}</span><span>${esc(detail)}</span>
-    </div>`;
-  }).join("");
+  
+  function renderStreams() {
+    $("#dlg-streams").innerHTML = dlgFile.streams.map((s, idx) => {
+      const removable = s.type === "audio" || s.type === "subtitle";
+      const isReorderable = isMKV && s.mkv_id >= 0;
+      
+      const reorderControls = isReorderable ? `
+        <span style="display: inline-flex; gap: 2px;">
+          <button type="button" class="btn-reorder" data-action="up" data-idx="${idx}" style="padding: 2px 4px; font-size: 10px; line-height: 1;" ${idx === 0 ? "disabled" : ""}>&uarr;</button>
+          <button type="button" class="btn-reorder" data-action="down" data-idx="${idx}" style="padding: 2px 4px; font-size: 10px; line-height: 1;" ${idx === dlgFile.streams.length - 1 ? "disabled" : ""}>&darr;</button>
+        </span>
+      ` : `<span style="width: 32px; display: inline-block;"></span>`;
+
+      const editControls = isMKV && s.mkv_id >= 0 ? `
+        <span style="display: inline-flex; align-items: center; gap: 4px; margin-left: auto;">
+          <input type="text" class="edit-lang" data-idx="${s.index}" value="${esc(s.lang || "")}" placeholder="lang" style="width: 45px; padding: 2px; font-size: 11px; height: 22px;">
+          <input type="text" class="edit-title" data-idx="${s.index}" value="${esc(s.title || "")}" placeholder="title" style="width: 100px; padding: 2px; font-size: 11px; height: 22px;">
+          <label style="margin: 0; display: inline-flex; align-items: center; gap: 2px; font-size: 11px; user-select: none;">
+            <input type="checkbox" class="edit-default" data-idx="${s.index}" ${s.default ? "checked" : ""}> def
+          </label>
+          <label style="margin: 0; display: inline-flex; align-items: center; gap: 2px; font-size: 11px; user-select: none;">
+            <input type="checkbox" class="edit-forced" data-idx="${s.index}" ${s.forced ? "checked" : ""}> forced
+          </label>
+        </span>
+      ` : "";
+
+      const detail = [s.codec, s.channel_layout].filter(Boolean).join(" · ");
+      
+      return `<div class="stream-row ${removable ? "" : "locked"}" style="display: flex; align-items: center; gap: 6px;">
+        <input type="checkbox" data-idx="${s.index}" data-type="${s.type}" ${removable ? "" : "disabled"}>
+        ${reorderControls}
+        <span class="tag" style="min-width: 4.8rem; font-size: 11.5px;">#${s.index} ${esc(s.type)}</span>
+        <span style="font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px;" title="${esc(detail)}">${esc(detail)}</span>
+        ${editControls}
+      </div>`;
+    }).join("");
+    
+    // Add event listeners to the reorder buttons
+    $$(".btn-reorder").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const action = btn.dataset.action;
+        const currentIdx = parseInt(btn.dataset.idx);
+        const targetIdx = action === "up" ? currentIdx - 1 : currentIdx + 1;
+        
+        // Swap streams in dlgFile.streams
+        const temp = dlgFile.streams[currentIdx];
+        dlgFile.streams[currentIdx] = dlgFile.streams[targetIdx];
+        dlgFile.streams[targetIdx] = temp;
+        
+        renderStreams();
+        $("#dlg-save-order").style.display = "inline-block";
+      });
+    });
+
+    // Synchronize inputs back to streams
+    $$(".edit-lang").forEach((input) => {
+      input.addEventListener("input", (e) => {
+        const idx = parseInt(input.dataset.idx);
+        const stream = dlgFile.streams.find((s) => s.index === idx);
+        if (stream) stream.lang = e.target.value;
+      });
+    });
+    $$(".edit-title").forEach((input) => {
+      input.addEventListener("input", (e) => {
+        const idx = parseInt(input.dataset.idx);
+        const stream = dlgFile.streams.find((s) => s.index === idx);
+        if (stream) stream.title = e.target.value;
+      });
+    });
+    $$(".edit-default").forEach((input) => {
+      input.addEventListener("change", (e) => {
+        const idx = parseInt(input.dataset.idx);
+        const stream = dlgFile.streams.find((s) => s.index === idx);
+        if (stream) stream.default = e.target.checked;
+      });
+    });
+    $$(".edit-forced").forEach((input) => {
+      input.addEventListener("change", (e) => {
+        const idx = parseInt(input.dataset.idx);
+        const stream = dlgFile.streams.find((s) => s.index === idx);
+        if (stream) stream.forced = e.target.checked;
+      });
+    });
+  }
+
+  renderStreams();
+
   $("#dlg-sidecars").innerHTML = (dlgFile.sidecars || []).map((sc) => `
     <div class="stream-row">
       <input type="checkbox" data-sidecar="${sc.id}">
@@ -364,6 +452,53 @@ $("#dlg-submit").addEventListener("click", async () => {
   try {
     const r = await api(`/files/${dlgFile.id}/jobs`, { method: "POST", body: req });
     toast(`Queued ${r.jobs.length} job(s)`);
+    $("#dlg-file").close();
+  } catch (err) { toast(err.message, true); }
+});
+
+$("#dlg-save-order").addEventListener("click", async () => {
+  const track_order = dlgFile.streams
+    .filter((s) => s.mkv_id >= 0)
+    .map((s) => s.index);
+  try {
+    await api(`/files/${dlgFile.id}/reorder`, {
+      method: "POST",
+      body: { track_order }
+    });
+    toast("Queued track reordering job");
+    $("#dlg-file").close();
+  } catch (err) { toast(err.message, true); }
+});
+
+$("#dlg-save-metadata").addEventListener("click", async () => {
+  const edits = dlgFile.streams
+    .filter((s) => s.mkv_id >= 0)
+    .map((s) => ({
+      track_index: s.index,
+      language: s.lang || "",
+      title: s.title || "",
+      default: s.default,
+      forced: s.forced,
+    }));
+  try {
+    await api(`/files/${dlgFile.id}/metadata`, {
+      method: "POST",
+      body: { edits }
+    });
+    toast("Queued header edit job");
+    $("#dlg-file").close();
+  } catch (err) { toast(err.message, true); }
+});
+
+$("#dlg-merge-btn").addEventListener("click", async () => {
+  const path = $("#dlg-merge-path").value.trim();
+  if (!path) return toast("Enter external file path first");
+  try {
+    await api(`/files/${dlgFile.id}/merge`, {
+      method: "POST",
+      body: { external_files: [path] }
+    });
+    toast("Queued track merge job");
     $("#dlg-file").close();
   } catch (err) { toast(err.message, true); }
 });

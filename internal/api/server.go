@@ -43,9 +43,10 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{
-			"status":   "ok",
-			"ffprobe":  s.Scanner.Prober.HasFFprobe(),
-			"mkvmerge": s.Scanner.Prober.HasMkvmerge(),
+			"status":      "ok",
+			"ffprobe":     s.Scanner.Prober.HasFFprobe(),
+			"mkvmerge":    s.Scanner.Prober.HasMkvmerge(),
+			"mkvpropedit": s.Engine.HasMkvpropedit(),
 		})
 	})
 	mux.HandleFunc("GET /api/v1/stats", s.handleStats)
@@ -61,6 +62,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/files", s.handleListFiles)
 	mux.HandleFunc("GET /api/v1/files/{id}", s.handleGetFile)
 	mux.HandleFunc("POST /api/v1/files/{id}/jobs", s.handleFileJobs)
+	mux.HandleFunc("POST /api/v1/files/{id}/metadata", s.handleEditMetadata)
+	mux.HandleFunc("POST /api/v1/files/{id}/reorder", s.handleReorderTracks)
+	mux.HandleFunc("POST /api/v1/files/{id}/merge", s.handleMergeTracks)
 	mux.HandleFunc("POST /api/v1/batch", s.handleBatch)
 
 	mux.HandleFunc("GET /api/v1/jobs", s.handleListJobs)
@@ -451,6 +455,204 @@ func (s *Server) enqueueForFile(d *fileDetail, req fileJobRequest) ([]*store.Job
 		return nil, errors.New("nothing to do")
 	}
 	return created, nil
+}
+
+// ---- metadata editing ----
+
+type editMetadataRequest struct {
+	Edits []engine.MetadataEdit `json:"edits"`
+}
+
+func (s *Server) handleEditMetadata(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	var req editMetadataRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	if len(req.Edits) == 0 {
+		writeErr(w, 400, errors.New("edits required"))
+		return
+	}
+	d, res, err := s.loadDetail(id)
+	if err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	if d == nil {
+		writeErr(w, 404, errors.New("file not found"))
+		return
+	}
+	if res == nil || !res.IsMatroska() {
+		writeErr(w, 400, errors.New("file is not a Matroska container; metadata editing requires MKV"))
+		return
+	}
+	j, err := s.Store.CreateJob("edit_metadata", d.ID, d.Path, jobs.EditMetadataPayload{
+		Edits: req.Edits,
+	})
+	if err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	s.Runner.Wake()
+	writeJSON(w, 201, map[string]any{"job": j})
+}
+
+// ---- track reordering and merging ----
+
+type reorderTracksRequest struct {
+	TrackOrder []int `json:"track_order"`
+}
+
+func (s *Server) handleReorderTracks(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	var req reorderTracksRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	if len(req.TrackOrder) == 0 {
+		writeErr(w, 400, errors.New("track_order is required"))
+		return
+	}
+	d, res, err := s.loadDetail(id)
+	if err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	if d == nil {
+		writeErr(w, 404, errors.New("file not found"))
+		return
+	}
+	if res == nil || !res.IsMatroska() {
+		writeErr(w, 400, errors.New("file is not a Matroska container; track reordering requires MKV"))
+		return
+	}
+	byIdx := map[int]probe.Stream{}
+	for _, s := range res.Streams {
+		byIdx[s.Index] = s
+	}
+	expectedCount := 0
+	for _, s := range res.Streams {
+		if s.MkvID >= 0 {
+			expectedCount++
+		}
+	}
+	if len(req.TrackOrder) != expectedCount {
+		writeErr(w, 400, fmt.Errorf("track order must contain exactly %d tracks, got %d", expectedCount, len(req.TrackOrder)))
+		return
+	}
+	seen := map[int]bool{}
+	for _, idx := range req.TrackOrder {
+		if seen[idx] {
+			writeErr(w, 400, fmt.Errorf("duplicate stream index %d in track order", idx))
+			return
+		}
+		seen[idx] = true
+
+		st, ok := byIdx[idx]
+		if !ok {
+			writeErr(w, 400, fmt.Errorf("stream index %d not found", idx))
+			return
+		}
+		if st.MkvID < 0 {
+			writeErr(w, 400, fmt.Errorf("stream index %d has no mkvmerge track ID", idx))
+			return
+		}
+	}
+
+	j, err := s.Store.CreateJob("reorder_tracks", d.ID, d.Path, jobs.ReorderPayload{
+		TrackOrder: req.TrackOrder,
+	})
+	if err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	s.Runner.Wake()
+	writeJSON(w, 201, map[string]any{"job": j})
+}
+
+type mergeTracksRequest struct {
+	ExternalFiles []string `json:"external_files"`
+}
+
+func (s *Server) handleMergeTracks(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	var req mergeTracksRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	if len(req.ExternalFiles) == 0 {
+		writeErr(w, 400, errors.New("external_files is required"))
+		return
+	}
+	d, res, err := s.loadDetail(id)
+	if err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	if d == nil {
+		writeErr(w, 404, errors.New("file not found"))
+		return
+	}
+	if res == nil || !res.IsMatroska() {
+		writeErr(w, 400, errors.New("file is not a Matroska container; merging tracks requires MKV"))
+		return
+	}
+	absPath, err := filepath.Abs(d.Path)
+	if err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	seenExt := map[string]bool{}
+	for _, ext := range req.ExternalFiles {
+		absExt, err := filepath.Abs(ext)
+		if err != nil {
+			writeErr(w, 400, fmt.Errorf("external file %s path: %w", ext, err))
+			return
+		}
+		if absExt == absPath {
+			writeErr(w, 400, fmt.Errorf("cannot merge a file into itself: %s", ext))
+			return
+		}
+		if seenExt[absExt] {
+			writeErr(w, 400, fmt.Errorf("duplicate external file: %s", ext))
+			return
+		}
+		seenExt[absExt] = true
+
+		fi, err := os.Stat(ext)
+		if err != nil {
+			writeErr(w, 400, fmt.Errorf("external file %s: %w", ext, err))
+			return
+		}
+		if fi.IsDir() {
+			writeErr(w, 400, fmt.Errorf("external file %s is a directory", ext))
+			return
+		}
+	}
+	j, err := s.Store.CreateJob("merge_tracks", d.ID, d.Path, jobs.MergePayload{
+		ExternalFiles: req.ExternalFiles,
+	})
+	if err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	s.Runner.Wake()
+	writeJSON(w, 201, map[string]any{"job": j})
 }
 
 // ---- batch ----

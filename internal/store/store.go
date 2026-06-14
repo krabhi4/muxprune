@@ -186,14 +186,14 @@ type Sidecar struct {
 }
 
 // GetFileByPathMeta returns id and probe staleness info for incremental scans.
-func (s *Store) GetFileByPathMeta(path string) (id, size, mtime int64, hasProbe bool, err error) {
+func (s *Store) GetFileByPathMeta(path string) (id, size, mtime int64, nlink int, sidecarSummary string, hasProbe bool, err error) {
 	var probeLen int
-	err = s.db.QueryRow(`SELECT id,size,mtime,length(probe_json) FROM media_files WHERE path=?`, path).
-		Scan(&id, &size, &mtime, &probeLen)
+	err = s.db.QueryRow(`SELECT id,size,mtime,nlink,sidecar_summary,length(probe_json) FROM media_files WHERE path=?`, path).
+		Scan(&id, &size, &mtime, &nlink, &sidecarSummary, &probeLen)
 	if err == sql.ErrNoRows {
-		return 0, 0, 0, false, nil
+		return 0, 0, 0, 0, "", false, nil
 	}
-	return id, size, mtime, probeLen > 0, err
+	return id, size, mtime, nlink, sidecarSummary, probeLen > 0, err
 }
 
 func (s *Store) UpsertMediaFile(f *MediaFile) error {
@@ -231,6 +231,39 @@ func (s *Store) TouchFile(id int64, nlink int, sidecarSummary string) error {
 	_, err := s.db.Exec(`UPDATE media_files SET scanned_at=?, nlink=?, sidecar_summary=? WHERE id=?`,
 		time.Now().Unix(), nlink, sidecarSummary, id)
 	return err
+}
+
+// TouchFilesBulk updates scanned_at for many file IDs in a single transaction,
+// batched to avoid exceeding SQLite's variable limit.
+func (s *Store) TouchFilesBulk(ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	const batchSize = 500
+	now := time.Now().Unix()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for i := 0; i < len(ids); i += batchSize {
+		end := i + batchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[i:end]
+		placeholders := strings.Repeat("?,", len(batch))
+		placeholders = placeholders[:len(placeholders)-1] // trim trailing comma
+		args := make([]any, 0, 1+len(batch))
+		args = append(args, now)
+		for _, id := range batch {
+			args = append(args, id)
+		}
+		if _, err := tx.Exec(`UPDATE media_files SET scanned_at=? WHERE id IN (`+placeholders+`)`, args...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // PruneFiles removes records for files not seen since the given scan start.

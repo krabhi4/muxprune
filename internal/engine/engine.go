@@ -46,20 +46,349 @@ type Result struct {
 	DryRun     bool   `json:"dry_run"`
 }
 
+type MetadataEdit struct {
+	TrackIndex int    `json:"track_index"` // ffprobe stream index
+	Language   string `json:"language,omitempty"`
+	Title      string `json:"title,omitempty"`
+	Default    *bool  `json:"default,omitempty"`
+	Forced     *bool  `json:"forced,omitempty"`
+}
+
 type Engine struct {
 	Prober     *probe.Prober
 	RecycleDir string // "" deletes sidecars permanently
 
-	once     sync.Once
-	ffmpeg   string
-	mkvmerge string
+	once        sync.Once
+	ffmpeg      string
+	mkvmerge    string
+	mkvpropedit string
 }
 
 func (e *Engine) resolve() {
 	e.once.Do(func() {
 		e.ffmpeg, _ = exec.LookPath("ffmpeg")
 		e.mkvmerge, _ = exec.LookPath("mkvmerge")
+		e.mkvpropedit, _ = exec.LookPath("mkvpropedit")
 	})
+}
+
+// HasMkvpropedit reports whether the mkvpropedit binary is available.
+func (e *Engine) HasMkvpropedit() bool { e.resolve(); return e.mkvpropedit != "" }
+
+// EditMetadata performs in-place header edits on a Matroska file using
+// mkvpropedit. This is orders of magnitude faster than a full remux for
+// metadata-only changes (language, title, default/forced flags).
+func (e *Engine) EditMetadata(ctx context.Context, path string, edits []MetadataEdit) (*Result, error) {
+	e.resolve()
+	if e.mkvpropedit == "" {
+		return nil, errors.New("mkvpropedit not found in PATH")
+	}
+	if len(edits) == 0 {
+		return nil, errors.New("no edits specified")
+	}
+
+	res, err := e.Prober.Probe(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if !res.IsMatroska() {
+		return nil, errors.New("mkvpropedit requires a Matroska file")
+	}
+
+	// Build a lookup from ffprobe stream index to Stream.
+	byIdx := map[int]probe.Stream{}
+	for _, s := range res.Streams {
+		byIdx[s.Index] = s
+	}
+
+	args := []string{path}
+	for _, edit := range edits {
+		st, ok := byIdx[edit.TrackIndex]
+		if !ok {
+			return nil, fmt.Errorf("stream index %d not found", edit.TrackIndex)
+		}
+		if st.MkvID < 0 {
+			return nil, fmt.Errorf("stream index %d has no mkvmerge track ID (MkvID unknown)", edit.TrackIndex)
+		}
+		args = append(args, "--edit", "track:="+strconv.Itoa(st.MkvID))
+		if edit.Language != "" {
+			args = append(args, "--set", "language="+edit.Language)
+		}
+		if edit.Title != "" {
+			args = append(args, "--set", "name="+edit.Title)
+		}
+		if edit.Default != nil {
+			args = append(args, "--set", "flag-default="+boolFlag(*edit.Default))
+		}
+		if edit.Forced != nil {
+			args = append(args, "--set", "flag-forced="+boolFlag(*edit.Forced))
+		}
+	}
+
+	cmdline := e.mkvpropedit + " " + strings.Join(args, " ")
+	tool, full := wrapNice(e.mkvpropedit, args)
+	cmd := exec.CommandContext(ctx, tool, full...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("mkvpropedit failed: %w: %s", err, tail(stderr.String(), 1000))
+	}
+	return &Result{Tool: "mkvpropedit", Command: cmdline, BytesSaved: 0}, nil
+}
+
+func boolFlag(v bool) string {
+	if v {
+		return "1"
+	}
+	return "0"
+}
+
+// ReorderSpec describes the desired track order for a Matroska remux.
+type ReorderSpec struct {
+	TrackOrder []int `json:"track_order"` // ffprobe stream indexes in desired order
+}
+
+// MergeSpec describes external files to merge into a Matroska container.
+type MergeSpec struct {
+	ExternalFiles []string `json:"external_files"` // paths to subtitle/audio files to merge in
+}
+
+// ReorderTracks remuxes a Matroska file with tracks in the specified order
+// using mkvmerge's --track-order flag.
+func (e *Engine) ReorderTracks(ctx context.Context, path string, spec ReorderSpec) (*Result, error) {
+	e.resolve()
+	if e.mkvmerge == "" {
+		return nil, errors.New("mkvmerge not found in PATH")
+	}
+	if len(spec.TrackOrder) == 0 {
+		return nil, errors.New("no track order specified")
+	}
+
+	res, err := e.Prober.Probe(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if !res.IsMatroska() {
+		return nil, errors.New("track reordering requires a Matroska file")
+	}
+
+	// Build lookup from ffprobe index to stream.
+	byIdx := map[int]probe.Stream{}
+	for _, s := range res.Streams {
+		byIdx[s.Index] = s
+	}
+
+	// Validate all indexes exist, have known MkvIDs, and have no duplicates.
+	// Also ensure that we are reordering the exact set of tracks present in the file.
+	expectedCount := 0
+	for _, s := range res.Streams {
+		if s.MkvID >= 0 {
+			expectedCount++
+		}
+	}
+	if len(spec.TrackOrder) != expectedCount {
+		return nil, fmt.Errorf("track order must contain exactly %d tracks, got %d", expectedCount, len(spec.TrackOrder))
+	}
+
+	seen := map[int]bool{}
+	for _, idx := range spec.TrackOrder {
+		if seen[idx] {
+			return nil, fmt.Errorf("duplicate stream index %d in track order", idx)
+		}
+		seen[idx] = true
+
+		st, ok := byIdx[idx]
+		if !ok {
+			return nil, fmt.Errorf("stream index %d not found", idx)
+		}
+		if st.MkvID < 0 {
+			return nil, fmt.Errorf("stream index %d has no mkvmerge track ID", idx)
+		}
+	}
+
+	// Build --track-order value: 0:mkvID1,0:mkvID2,...
+	var orderParts []string
+	for _, idx := range spec.TrackOrder {
+		orderParts = append(orderParts, fmt.Sprintf("0:%d", byIdx[idx].MkvID))
+	}
+	trackOrder := strings.Join(orderParts, ",")
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	dir := filepath.Dir(path)
+	if free, err := freeSpace(dir); err == nil && free < uint64(info.Size()) {
+		return nil, fmt.Errorf("not enough free space in %s: need %d, have %d", dir, info.Size(), free)
+	}
+
+	ext := filepath.Ext(path)
+	base := strings.TrimSuffix(filepath.Base(path), ext)
+	tmp := filepath.Join(dir, "."+base+".muxprune.tmp"+ext)
+	defer os.Remove(tmp)
+
+	args := []string{"-q", "-o", tmp, "--track-order", trackOrder, path}
+	cmdline := e.mkvmerge + " " + strings.Join(args, " ")
+	tool, full := wrapNice(e.mkvmerge, args)
+	cmd := exec.CommandContext(ctx, tool, full...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("mkvmerge failed: %w: %s", err, tail(stderr.String(), 1000))
+	}
+
+	// Verify: all stream type counts must match exactly (reorder, not remove).
+	if err := e.verify(ctx, res, RemovalSpec{}, tmp); err != nil {
+		return nil, fmt.Errorf("output verification failed, original untouched: %w", err)
+	}
+
+	outInfo, err := os.Stat(tmp)
+	if err != nil {
+		return nil, err
+	}
+	preserveAttrs(tmp, info)
+	if err := os.Rename(tmp, path); err != nil {
+		return nil, fmt.Errorf("atomic rename: %w", err)
+	}
+	saved := info.Size() - outInfo.Size()
+	if saved < 0 {
+		saved = 0
+	}
+	return &Result{
+		Tool: "mkvmerge", Command: cmdline,
+		BytesSaved: saved,
+	}, nil
+}
+
+// MergeTracks merges external subtitle/audio files into a Matroska container
+// using mkvmerge.
+func (e *Engine) MergeTracks(ctx context.Context, path string, spec MergeSpec) (*Result, error) {
+	e.resolve()
+	if e.mkvmerge == "" {
+		return nil, errors.New("mkvmerge not found in PATH")
+	}
+	if len(spec.ExternalFiles) == 0 {
+		return nil, errors.New("no external files specified")
+	}
+
+	res, err := e.Prober.Probe(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if !res.IsMatroska() {
+		return nil, errors.New("track merging requires a Matroska file")
+	}
+
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+
+	// Verify each external file exists, is not the input file, and is not a duplicate.
+	seenExt := map[string]bool{}
+	for _, ext := range spec.ExternalFiles {
+		absExt, err := filepath.Abs(ext)
+		if err != nil {
+			return nil, fmt.Errorf("external file %s path: %w", ext, err)
+		}
+		if absExt == absPath {
+			return nil, fmt.Errorf("cannot merge a file into itself: %s", ext)
+		}
+		if seenExt[absExt] {
+			return nil, fmt.Errorf("duplicate external file specified: %s", ext)
+		}
+		seenExt[absExt] = true
+
+		fi, err := os.Stat(ext)
+		if err != nil {
+			return nil, fmt.Errorf("external file %s: %w", ext, err)
+		}
+		if fi.IsDir() {
+			return nil, fmt.Errorf("external file %s is a directory", ext)
+		}
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	dir := filepath.Dir(path)
+	if free, err := freeSpace(dir); err == nil && free < uint64(info.Size()) {
+		return nil, fmt.Errorf("not enough free space in %s: need %d, have %d", dir, info.Size(), free)
+	}
+
+	ext := filepath.Ext(path)
+	base := strings.TrimSuffix(filepath.Base(path), ext)
+	tmp := filepath.Join(dir, "."+base+".muxprune.tmp"+ext)
+	defer os.Remove(tmp)
+
+	args := []string{"-q", "-o", tmp, path}
+	args = append(args, spec.ExternalFiles...)
+	cmdline := e.mkvmerge + " " + strings.Join(args, " ")
+	tool, full := wrapNice(e.mkvmerge, args)
+	cmd := exec.CommandContext(ctx, tool, full...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("mkvmerge failed: %w: %s", err, tail(stderr.String(), 1000))
+	}
+
+	// Verify: video same, audio >= original, subtitle >= original.
+	if err := e.verifyMerge(ctx, res, tmp); err != nil {
+		return nil, fmt.Errorf("output verification failed, original untouched: %w", err)
+	}
+
+	outInfo, err := os.Stat(tmp)
+	if err != nil {
+		return nil, err
+	}
+	preserveAttrs(tmp, info)
+	if err := os.Rename(tmp, path); err != nil {
+		return nil, fmt.Errorf("atomic rename: %w", err)
+	}
+	saved := info.Size() - outInfo.Size()
+	if saved < 0 {
+		saved = 0
+	}
+	return &Result{
+		Tool: "mkvmerge", Command: cmdline,
+		BytesSaved: saved,
+	}, nil
+}
+
+// verifyMerge checks that a merge output has at least as many tracks as the
+// input: video count must match, audio and subtitle counts must be >=.
+func (e *Engine) verifyMerge(ctx context.Context, in *probe.Result, tmp string) error {
+	out, err := e.Prober.Probe(ctx, tmp)
+	if err != nil {
+		return fmt.Errorf("probing output: %w", err)
+	}
+	if got := len(out.StreamsOfType("video")); got != len(in.StreamsOfType("video")) {
+		return fmt.Errorf("video stream count changed: %d -> %d", len(in.StreamsOfType("video")), got)
+	}
+	if got := len(out.StreamsOfType("audio")); got < len(in.StreamsOfType("audio")) {
+		return fmt.Errorf("audio stream count decreased: %d -> %d", len(in.StreamsOfType("audio")), got)
+	}
+	if got := len(out.StreamsOfType("subtitle")); got < len(in.StreamsOfType("subtitle")) {
+		return fmt.Errorf("subtitle stream count decreased: %d -> %d", len(in.StreamsOfType("subtitle")), got)
+	}
+	if in.Duration > 0 && out.Duration > 0 {
+		diff := in.Duration - out.Duration
+		if diff < 0 {
+			diff = -diff
+		}
+		tolerance := in.Duration * 0.01
+		if tolerance < 2.0 {
+			tolerance = 2.0
+		}
+		if tolerance > 60.0 {
+			tolerance = 60.0
+		}
+		if diff > tolerance {
+			return fmt.Errorf("duration drifted: %.2fs -> %.2fs (tolerance %.2fs)", in.Duration, out.Duration, tolerance)
+		}
+	}
+	return nil
 }
 
 // RemoveTracks losslessly remuxes path without the specified streams.
@@ -107,6 +436,7 @@ func (e *Engine) RemoveTracks(ctx context.Context, path string, spec RemovalSpec
 	defer os.Remove(tmp) // no-op after successful rename
 	full := append(slices.Clone(args), outputArgs(tool, tmp)...)
 	full = reorderOutput(tool, full, tmp)
+	tool, full = wrapNice(tool, full)
 	cmd := exec.CommandContext(ctx, tool, full...)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
