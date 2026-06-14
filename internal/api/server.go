@@ -68,6 +68,7 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/v1/jobs", s.handleListJobs)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/cancel", s.handleCancelJob)
+	mux.HandleFunc("DELETE /api/v1/jobs/{id}", s.handleDeleteJob)
 	mux.HandleFunc("GET /api/v1/events", s.Hub.ServeSSE)
 	mux.HandleFunc("POST /api/v1/webhooks/arr", s.handleArrWebhook)
 
@@ -789,6 +790,20 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	}
 	s.Hub.Notify("job", map[string]any{"id": id, "status": "failed", "log": "cancelled by user"})
 	writeJSON(w, 200, map[string]string{"status": "cancelled"})
+}
+
+func (s *Server) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	if err := s.Store.DeleteJob(id); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	s.Hub.Notify("job", map[string]any{"id": id, "action": "deleted"})
+	writeJSON(w, 200, map[string]string{"status": "deleted"})
 }
 
 // handleArrWebhook accepts Sonarr/Radarr "On Import" webhooks and rescans the

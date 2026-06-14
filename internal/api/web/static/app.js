@@ -749,6 +749,7 @@ async function loadJobs() {
       <td class="sub">${esc(j.log)}</td>
       <td class="num">
         ${j.status === "queued" ? `<button data-act="cancel">Cancel</button>` : ""}
+        ${j.status === "done" || j.status === "failed" || j.status === "skipped" ? `<button data-act="del" class="danger">Delete</button>` : ""}
       </td>
     </tr>`).join("");
   $("#jobs-empty").hidden = data.jobs.length > 0;
@@ -773,6 +774,15 @@ $("#jobs-table").addEventListener("click", async (e) => {
     try {
       await api(`/jobs/${id}/cancel`, { method: "POST" });
       toast(`Job #${id} cancelled`);
+      loadJobs();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  } else if (btn.dataset.act === "del") {
+    if (!confirm(`Delete job #${id} from history?`)) return;
+    try {
+      await api(`/jobs/${id}`, { method: "DELETE" });
+      toast(`Job #${id} deleted`);
       loadJobs();
     } catch (err) {
       toast(err.message, true);

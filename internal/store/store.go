@@ -576,6 +576,22 @@ func (s *Store) CancelJob(id int64) error {
 	return nil
 }
 
+func (s *Store) DeleteJob(id int64) error {
+	res, err := s.db.Exec(`DELETE FROM jobs WHERE id=? AND status != 'running'`, id)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("job %d is running and cannot be deleted", id)
+	}
+	return nil
+}
+
+
 // FailInterrupted marks jobs left 'running' by a previous process as failed.
 func (s *Store) FailInterrupted() (int64, error) {
 	res, err := s.db.Exec(`UPDATE jobs SET status='failed', log='interrupted by restart', finished_at=?

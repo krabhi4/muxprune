@@ -220,6 +220,17 @@ func (s *Server) handleMCPRequest(ctx context.Context, w io.Writer, req *jsonRPC
 				},
 			},
 			{
+				"name":        "delete_job",
+				"description": "Delete a finished, failed, or skipped job from history.",
+				"inputSchema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"id": map[string]any{"type": "integer", "description": "The job ID to delete"},
+					},
+					"required": []string{"id"},
+				},
+			},
+			{
 				"name":        "list_jobs",
 				"description": "List or search background jobs.",
 				"inputSchema": map[string]any{
@@ -576,6 +587,21 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 		}
 		s.Hub.Notify("job", map[string]any{"id": jArgs.ID, "status": "failed", "log": "cancelled by user"})
 		sendMCPToolResult(w, id, fmt.Sprintf("Job %d cancelled", jArgs.ID))
+
+	case "delete_job":
+		var jArgs struct {
+			ID int64 `json:"id"`
+		}
+		if err := json.Unmarshal(args, &jArgs); err != nil || jArgs.ID == 0 {
+			sendMCPToolError(w, id, "Invalid or missing job 'id' argument")
+			return
+		}
+		if err := s.Store.DeleteJob(jArgs.ID); err != nil {
+			sendMCPToolError(w, id, err.Error())
+			return
+		}
+		s.Hub.Notify("job", map[string]any{"id": jArgs.ID, "action": "deleted"})
+		sendMCPToolResult(w, id, fmt.Sprintf("Job %d deleted", jArgs.ID))
 
 	case "list_jobs":
 		var filter struct {
