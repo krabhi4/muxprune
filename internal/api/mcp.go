@@ -112,7 +112,13 @@ func (s *Server) handleMCPRequest(ctx context.Context, w io.Writer, req *jsonRPC
 					"properties": map[string]any{
 						"library_id": map[string]any{"type": "integer", "description": "Filter by library ID"},
 						"q":          map[string]any{"type": "string", "description": "Search query for title or path"},
+						"kind":       map[string]any{"type": "string", "description": "Filter by kind (tv, movie, other)"},
+						"hardlinks":  map[string]any{"type": "string", "description": "Filter by hardlinks (yes, no)"},
+						"subs":       map[string]any{"type": "string", "description": "Filter by subtitles (any, none, embedded, none_embedded, sidecar, none_sidecar)"},
+						"sort":       map[string]any{"type": "string", "description": "Sort: title, size, mtime, nlink, scanned_at"},
+						"order":      map[string]any{"type": "string", "description": "Sort order: asc, desc"},
 						"limit":      map[string]any{"type": "integer", "description": "Maximum results (default 50)"},
+						"offset":     map[string]any{"type": "integer", "description": "Pagination offset (default 0)"},
 					},
 				},
 			},
@@ -202,6 +208,37 @@ func (s *Server) handleMCPRequest(ctx context.Context, w io.Writer, req *jsonRPC
 					"required": []string{"id"},
 				},
 			},
+			{
+				"name":        "list_jobs",
+				"description": "List or search background jobs.",
+				"inputSchema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"status": map[string]any{"type": "string", "description": "Filter by status (queued, running, done, failed, skipped)"},
+						"limit":  map[string]any{"type": "integer", "description": "Maximum results (default 50)"},
+						"offset": map[string]any{"type": "integer", "description": "Pagination offset (default 0)"},
+					},
+				},
+			},
+			{
+				"name":        "queue_scan_job",
+				"description": "Queue a job to scan a specific media library.",
+				"inputSchema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"library_id": map[string]any{"type": "integer", "description": "The library ID to scan"},
+					},
+					"required": []string{"library_id"},
+				},
+			},
+			{
+				"name":        "queue_scan_all_job",
+				"description": "Queue a job to scan all configured media libraries.",
+				"inputSchema": map[string]any{
+					"type":       "object",
+					"properties": map[string]any{},
+				},
+			},
 		}
 		sendMCPResponse(w, req.ID, map[string]any{"tools": tools})
 
@@ -237,7 +274,13 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 		var filter struct {
 			LibraryID int64  `json:"library_id"`
 			Q         string `json:"q"`
+			Kind      string `json:"kind"`
+			Hardlinks string `json:"hardlinks"`
+			Subs      string `json:"subs"`
+			Sort      string `json:"sort"`
+			Order     string `json:"order"`
 			Limit     int    `json:"limit"`
+			Offset    int    `json:"offset"`
 		}
 		_ = json.Unmarshal(args, &filter)
 		if filter.Limit <= 0 {
@@ -246,9 +289,13 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 		files, _, err := s.Store.ListFiles(store.FileFilter{
 			LibraryID: filter.LibraryID,
 			Query:     filter.Q,
-			Sort:      "default",
-			Order:     "asc",
+			Kind:      filter.Kind,
+			Hardlinks: filter.Hardlinks,
+			Subs:      filter.Subs,
+			Sort:      filter.Sort,
+			Order:     filter.Order,
 			Limit:     filter.Limit,
+			Offset:    filter.Offset,
 		})
 		if err != nil {
 			sendMCPToolError(w, id, err.Error())
@@ -503,6 +550,78 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 		}
 		b, _ := json.MarshalIndent(job, "", "  ")
 		sendMCPToolResult(w, id, string(b))
+
+	case "list_jobs":
+		var filter struct {
+			Status string `json:"status"`
+			Limit  int    `json:"limit"`
+			Offset int    `json:"offset"`
+		}
+		_ = json.Unmarshal(args, &filter)
+		if filter.Limit <= 0 {
+			filter.Limit = 50
+		}
+		jobsList, _, err := s.Store.ListJobs(filter.Status, filter.Limit, filter.Offset)
+		if err != nil {
+			sendMCPToolError(w, id, err.Error())
+			return
+		}
+		b, _ := json.MarshalIndent(jobsList, "", "  ")
+		sendMCPToolResult(w, id, string(b))
+
+	case "queue_scan_job":
+		var sArgs struct {
+			LibraryID int64 `json:"library_id"`
+		}
+		if err := json.Unmarshal(args, &sArgs); err != nil || sArgs.LibraryID == 0 {
+			sendMCPToolError(w, id, "Invalid or missing 'library_id' argument")
+			return
+		}
+		lib, err := s.Store.GetLibrary(sArgs.LibraryID)
+		if err != nil {
+			sendMCPToolError(w, id, err.Error())
+			return
+		}
+		if lib == nil {
+			sendMCPToolError(w, id, "Library not found")
+			return
+		}
+		active, err := s.Store.IsScanActive(lib.ID)
+		if err != nil {
+			sendMCPToolError(w, id, err.Error())
+			return
+		}
+		if active {
+			sendMCPToolError(w, id, "Scan already running or queued for this library")
+			return
+		}
+		j, err := s.Store.CreateJob("scan_library", 0, lib.Path, jobs.ScanLibraryPayload{LibraryID: lib.ID})
+		if err != nil {
+			sendMCPToolError(w, id, err.Error())
+			return
+		}
+		s.Runner.Wake()
+		b, _ := json.MarshalIndent(j, "", "  ")
+		sendMCPToolResult(w, id, "Scan job queued:\n"+string(b))
+
+	case "queue_scan_all_job":
+		active, err := s.Store.IsScanAllActive()
+		if err != nil {
+			sendMCPToolError(w, id, err.Error())
+			return
+		}
+		if active {
+			sendMCPToolError(w, id, "Scan all already queued or running")
+			return
+		}
+		j, err := s.Store.CreateJob("scan_all", 0, "all libraries", map[string]any{})
+		if err != nil {
+			sendMCPToolError(w, id, err.Error())
+			return
+		}
+		s.Runner.Wake()
+		b, _ := json.MarshalIndent(j, "", "  ")
+		sendMCPToolResult(w, id, "Scan all job queued:\n"+string(b))
 
 	default:
 		sendMCPToolError(w, id, "Unknown tool: "+toolName)
