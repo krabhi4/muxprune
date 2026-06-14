@@ -47,17 +47,125 @@ function toast(msg, isError = false) {
   toastTimer = setTimeout(() => (t.hidden = true), isError ? 6000 : 3000);
 }
 
-// ---- view switching ----
+// ---- state management & routing ----
+const state = {
+  view: "files",
+  // Files view
+  filesPage: 1,
+  filesLimit: 50,
+  filesLibrary: "",
+  filesKind: "",
+  filesHardlinks: "",
+  filesSubs: "",
+  filesQ: "",
+  filesSort: "default",
+  filesOrder: "asc",
+  // Libraries view
+  librariesPage: 1,
+  librariesLimit: 10,
+  // Jobs view
+  jobsPage: 1,
+  jobsLimit: 50,
+  jobsStatus: ""
+};
+
+function updateURL() {
+  const url = new URL(window.location.href);
+  const p = url.searchParams;
+  p.set("view", state.view);
+
+  if (state.view === "files") {
+    if (state.filesLibrary) p.set("library", state.filesLibrary); else p.delete("library");
+    if (state.filesKind) p.set("kind", state.filesKind); else p.delete("kind");
+    if (state.filesHardlinks) p.set("hardlinks", state.filesHardlinks); else p.delete("hardlinks");
+    if (state.filesSubs) p.set("subs", state.filesSubs); else p.delete("subs");
+    if (state.filesQ) p.set("q", state.filesQ); else p.delete("q");
+    if (state.filesSort !== "default") p.set("sort", state.filesSort); else p.delete("sort");
+    if (state.filesOrder !== "asc") p.set("order", state.filesOrder); else p.delete("order");
+    if (state.filesPage > 1) p.set("fpage", String(state.filesPage)); else p.delete("fpage");
+  } else {
+    ["library", "kind", "hardlinks", "subs", "q", "sort", "order", "fpage"].forEach(k => p.delete(k));
+  }
+
+  if (state.view === "libraries") {
+    if (state.librariesPage > 1) p.set("lpage", String(state.librariesPage)); else p.delete("lpage");
+  } else {
+    p.delete("lpage");
+  }
+
+  if (state.view === "jobs") {
+    if (state.jobsStatus) p.set("status", state.jobsStatus); else p.delete("status");
+    if (state.jobsPage > 1) p.set("jpage", String(state.jobsPage)); else p.delete("jpage");
+  } else {
+    ["status", "jpage"].forEach(k => p.delete(k));
+  }
+
+  history.replaceState(null, "", url.pathname + url.search);
+}
+
+function parseURL() {
+  const p = new URLSearchParams(window.location.search);
+  state.view = p.get("view") || "files";
+  if (!["files", "libraries", "jobs"].includes(state.view)) state.view = "files";
+
+  state.filesLibrary = p.get("library") || "";
+  state.filesKind = p.get("kind") || "";
+  state.filesHardlinks = p.get("hardlinks") || "";
+  state.filesSubs = p.get("subs") || "";
+  state.filesQ = p.get("q") || "";
+  state.filesSort = p.get("sort") || "default";
+  state.filesOrder = p.get("order") || "asc";
+  state.filesPage = parseInt(p.get("fpage") || "1") || 1;
+
+  state.librariesPage = parseInt(p.get("lpage") || "1") || 1;
+
+  state.jobsStatus = p.get("status") || "";
+  state.jobsPage = parseInt(p.get("jpage") || "1") || 1;
+}
+
+function syncInputsToState() {
+  $$("nav button").forEach((btn) => btn.classList.toggle("active", btn.dataset.view === state.view));
+  ["files", "libraries", "jobs"].forEach((v) => ($("#view-" + v).hidden = v !== state.view));
+
+  $("#filter-library").value = state.filesLibrary;
+  $("#filter-kind").value = state.filesKind;
+  $("#filter-hardlinks").value = state.filesHardlinks;
+  $("#filter-subs").value = state.filesSubs;
+  $("#filter-q").value = state.filesQ;
+  $("#sort-by").value = state.filesSort;
+  $("#sort-order").value = state.filesOrder;
+
+  $("#filter-job-status").value = state.jobsStatus;
+}
+
+function syncStateFromInputs() {
+  state.filesLibrary = $("#filter-library").value;
+  state.filesKind = $("#filter-kind").value;
+  state.filesHardlinks = $("#filter-hardlinks").value;
+  state.filesSubs = $("#filter-subs").value;
+  state.filesQ = $("#filter-q").value.trim();
+  state.filesSort = $("#sort-by").value;
+  state.filesOrder = $("#sort-order").value;
+
+  state.jobsStatus = $("#filter-job-status").value;
+}
+
 $$("nav button").forEach((b) =>
   b.addEventListener("click", () => {
-    $$("nav button").forEach((x) => x.classList.toggle("active", x === b));
-    ["files", "libraries", "jobs"].forEach((v) =>
-      ($("#view-" + v).hidden = v !== b.dataset.view));
-    refresh(b.dataset.view);
+    state.view = b.dataset.view;
+    updateURL();
+    syncInputsToState();
+    refresh();
   }));
 
+window.addEventListener("popstate", () => {
+  parseURL();
+  syncInputsToState();
+  refresh();
+});
+
 function currentView() {
-  return $("nav button.active").dataset.view;
+  return state.view;
 }
 
 function refresh(view = currentView()) {
@@ -80,8 +188,26 @@ let libraries = [];
 
 async function loadLibraries() {
   libraries = await api("/libraries");
+  const sel = $("#filter-library");
+  sel.innerHTML = '<option value="">All libraries</option>' +
+    libraries.map((l) => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
+  sel.value = state.filesLibrary;
+  renderLibraries();
+}
+
+function renderLibraries() {
+  const totalPages = Math.ceil(libraries.length / state.librariesLimit) || 1;
+  if (state.librariesPage > totalPages) {
+    state.librariesPage = totalPages;
+    updateURL();
+  }
+
   const tbody = $("#libraries-table tbody");
-  tbody.innerHTML = libraries.map((l) => `
+  const start = (state.librariesPage - 1) * state.librariesLimit;
+  const end = start + state.librariesLimit;
+  const pageLibs = libraries.slice(start, end);
+
+  tbody.innerHTML = pageLibs.map((l) => `
     <tr data-id="${l.id}">
       <td>${esc(l.name)}</td><td class="muted">${esc(l.path)}</td><td>${esc(l.kind)}</td>
       <td>${esc(l.hardlink_policy)}</td>
@@ -92,12 +218,27 @@ async function loadLibraries() {
       </td>
     </tr>`).join("");
   $("#libraries-empty").hidden = libraries.length > 0;
-  const sel = $("#filter-library");
-  const cur = sel.value;
-  sel.innerHTML = '<option value="">All libraries</option>' +
-    libraries.map((l) => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
-  sel.value = cur;
+
+  $("#libs-page-info").textContent = `Page ${state.librariesPage} of ${totalPages} (${libraries.length} total)`;
+  $("#btn-libs-prev").disabled = state.librariesPage <= 1;
+  $("#btn-libs-next").disabled = state.librariesPage >= totalPages;
 }
+
+$("#btn-libs-prev").addEventListener("click", () => {
+  if (state.librariesPage > 1) {
+    state.librariesPage--;
+    updateURL();
+    renderLibraries();
+  }
+});
+$("#btn-libs-next").addEventListener("click", () => {
+  const totalPages = Math.ceil(libraries.length / state.librariesLimit) || 1;
+  if (state.librariesPage < totalPages) {
+    state.librariesPage++;
+    updateURL();
+    renderLibraries();
+  }
+});
 
 $("#libraries-table").addEventListener("click", async (e) => {
   const btn = e.target.closest("button");
@@ -214,6 +355,7 @@ $("#dlg-library-form").addEventListener("submit", async (e) => {
 // ---- files ----
 const selection = new Set();
 let filesCache = [];
+let filesTotal = 0;
 
 function badges(summary, cls) {
   return (summary || "").split(" ").filter(Boolean)
@@ -228,27 +370,22 @@ function fileLabel(f) {
 async function loadFiles() {
   if (!libraries.length) await loadLibraries().catch(() => {});
   const params = new URLSearchParams();
-  const lib = $("#filter-library").value;
-  const q = $("#filter-q").value.trim();
-  const kind = $("#filter-kind").value;
-  const hardlinks = $("#filter-hardlinks").value;
-  const subs = $("#filter-subs").value;
-  const sort = $("#sort-by").value;
-  const order = $("#sort-order").value;
-
-  if (lib) params.set("library", lib);
-  if (q) params.set("q", q);
-  if (kind) params.set("kind", kind);
-  if (hardlinks) params.set("hardlinks", hardlinks);
-  if (subs) params.set("subs", subs);
-  if (sort) params.set("sort", sort);
-  if (order) params.set("order", order);
-  params.set("limit", "500");
+  if (state.filesLibrary) params.set("library", state.filesLibrary);
+  if (state.filesQ) params.set("q", state.filesQ);
+  if (state.filesKind) params.set("kind", state.filesKind);
+  if (state.filesHardlinks) params.set("hardlinks", state.filesHardlinks);
+  if (state.filesSubs) params.set("subs", state.filesSubs);
+  if (state.filesSort) params.set("sort", state.filesSort);
+  if (state.filesOrder) params.set("order", state.filesOrder);
+  params.set("limit", String(state.filesLimit));
+  params.set("offset", String((state.filesPage - 1) * state.filesLimit));
 
   const data = await api("/files?" + params);
-  filesCache = data.files;
+  filesCache = data.files || [];
+  filesTotal = data.total || 0;
+
   const tbody = $("#files-table tbody");
-  tbody.innerHTML = data.files.map((f) => `
+  tbody.innerHTML = filesCache.map((f) => `
     <tr data-id="${f.id}">
       <td class="col-check"><input type="checkbox" data-id="${f.id}" ${selection.has(f.id) ? "checked" : ""}></td>
       <td>
@@ -262,18 +399,54 @@ async function loadFiles() {
       <td class="num">${human(f.size)}</td>
       <td class="num"><button data-act="open">Edit</button></td>
     </tr>`).join("");
-  $("#files-empty").hidden = data.files.length > 0;
+  $("#files-empty").hidden = filesCache.length > 0;
   updateSelectionUI();
+
+  const totalPages = Math.ceil(filesTotal / state.filesLimit) || 1;
+  if (state.filesPage > totalPages) {
+    state.filesPage = totalPages;
+    updateURL();
+    return loadFiles();
+  }
+  $("#files-page-info").textContent = `Page ${state.filesPage} of ${totalPages} (${filesTotal} total)`;
+  $("#btn-files-prev").disabled = state.filesPage <= 1;
+  $("#btn-files-next").disabled = state.filesPage >= totalPages;
 }
 
 let qTimer;
-$("#filter-q").addEventListener("input", () => { clearTimeout(qTimer); qTimer = setTimeout(loadFiles, 300); });
-$("#filter-library").addEventListener("change", loadFiles);
-$("#filter-kind").addEventListener("change", loadFiles);
-$("#filter-hardlinks").addEventListener("change", loadFiles);
-$("#filter-subs").addEventListener("change", loadFiles);
-$("#sort-by").addEventListener("change", loadFiles);
-$("#sort-order").addEventListener("change", loadFiles);
+function onFilesFilterChange() {
+  syncStateFromInputs();
+  state.filesPage = 1;
+  updateURL();
+  loadFiles();
+}
+
+$("#filter-q").addEventListener("input", () => {
+  clearTimeout(qTimer);
+  qTimer = setTimeout(onFilesFilterChange, 300);
+});
+$("#filter-library").addEventListener("change", onFilesFilterChange);
+$("#filter-kind").addEventListener("change", onFilesFilterChange);
+$("#filter-hardlinks").addEventListener("change", onFilesFilterChange);
+$("#filter-subs").addEventListener("change", onFilesFilterChange);
+$("#sort-by").addEventListener("change", onFilesFilterChange);
+$("#sort-order").addEventListener("change", onFilesFilterChange);
+
+$("#btn-files-prev").addEventListener("click", () => {
+  if (state.filesPage > 1) {
+    state.filesPage--;
+    updateURL();
+    loadFiles();
+  }
+});
+$("#btn-files-next").addEventListener("click", () => {
+  const totalPages = Math.ceil(filesTotal / state.filesLimit) || 1;
+  if (state.filesPage < totalPages) {
+    state.filesPage++;
+    updateURL();
+    loadFiles();
+  }
+});
 
 $("#files-table").addEventListener("click", (e) => {
   const check = e.target.closest('input[type="checkbox"]');
@@ -555,19 +728,16 @@ $("#batch-submit").addEventListener("click", async () => {
 });
 
 // ---- jobs ----
-let jobsPage = 1;
-const jobsLimit = 50;
 let jobsTotal = 0;
 
 async function loadJobs() {
   const params = new URLSearchParams();
-  const status = $("#filter-job-status").value;
-  if (status) params.set("status", status);
-  params.set("limit", String(jobsLimit));
-  params.set("offset", String((jobsPage - 1) * jobsLimit));
+  if (state.jobsStatus) params.set("status", state.jobsStatus);
+  params.set("limit", String(state.jobsLimit));
+  params.set("offset", String((state.jobsPage - 1) * state.jobsLimit));
 
   const data = await api("/jobs?" + params);
-  jobsTotal = data.total;
+  jobsTotal = data.total || 0;
 
   const tbody = $("#jobs-table tbody");
   tbody.innerHTML = data.jobs.map((j) => `
@@ -580,28 +750,36 @@ async function loadJobs() {
     </tr>`).join("");
   $("#jobs-empty").hidden = data.jobs.length > 0;
 
-  const totalPages = Math.ceil(jobsTotal / jobsLimit) || 1;
-  if (jobsPage > totalPages) jobsPage = totalPages;
-  $("#jobs-page-info").textContent = `Page ${jobsPage} of ${totalPages} (${jobsTotal} total)`;
-  $("#btn-jobs-prev").disabled = jobsPage <= 1;
-  $("#btn-jobs-next").disabled = jobsPage >= totalPages;
+  const totalPages = Math.ceil(jobsTotal / state.jobsLimit) || 1;
+  if (state.jobsPage > totalPages) {
+    state.jobsPage = totalPages;
+    updateURL();
+    return loadJobs();
+  }
+  $("#jobs-page-info").textContent = `Page ${state.jobsPage} of ${totalPages} (${jobsTotal} total)`;
+  $("#btn-jobs-prev").disabled = state.jobsPage <= 1;
+  $("#btn-jobs-next").disabled = state.jobsPage >= totalPages;
 }
 $("#jobs-table").style.cursor = "default";
 
 $("#filter-job-status").addEventListener("change", () => {
-  jobsPage = 1;
+  syncStateFromInputs();
+  state.jobsPage = 1;
+  updateURL();
   loadJobs();
 });
 $("#btn-jobs-prev").addEventListener("click", () => {
-  if (jobsPage > 1) {
-    jobsPage--;
+  if (state.jobsPage > 1) {
+    state.jobsPage--;
+    updateURL();
     loadJobs();
   }
 });
 $("#btn-jobs-next").addEventListener("click", () => {
-  const totalPages = Math.ceil(jobsTotal / jobsLimit) || 1;
-  if (jobsPage < totalPages) {
-    jobsPage++;
+  const totalPages = Math.ceil(jobsTotal / state.jobsLimit) || 1;
+  if (state.jobsPage < totalPages) {
+    state.jobsPage++;
+    updateURL();
     loadJobs();
   }
 });
@@ -637,6 +815,10 @@ function connectEvents() {
 }
 
 // ---- boot ----
-loadLibraries().then(loadFiles).catch((e) => toast(e.message, true));
+parseURL();
+syncInputsToState();
+loadLibraries().then(() => {
+  refresh();
+}).catch((e) => toast(e.message, true));
 loadStats();
 connectEvents();

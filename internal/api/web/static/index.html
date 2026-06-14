@@ -75,6 +75,11 @@
       <tbody></tbody>
     </table>
     <div id="files-empty" class="empty" hidden>No files. Add a library and scan it.</div>
+    <div class="pagination-bar" id="files-pagination">
+      <button id="btn-files-prev" disabled>Previous</button>
+      <span id="files-page-info">Page 1</span>
+      <button id="btn-files-next" disabled>Next</button>
+    </div>
   </section>
 
   <section id="view-libraries" hidden>
@@ -89,6 +94,11 @@
     <div id="libraries-empty" class="empty" hidden>
       No libraries yet. Add your media roots (the same paths Sonarr/Radarr write to).
     </div>
+    <div class="pagination-bar" id="libraries-pagination">
+      <button id="btn-libs-prev" disabled>Previous</button>
+      <span id="libs-page-info">Page 1</span>
+      <button id="btn-libs-next" disabled>Next</button>
+    </div>
   </section>
 
   <section id="view-jobs" hidden>
@@ -101,16 +111,17 @@
         <option value="failed">Failed</option>
         <option value="skipped">Skipped</option>
       </select>
-      <span class="spacer"></span>
-      <button id="btn-jobs-prev" disabled>Previous</button>
-      <span id="jobs-page-info" style="font-size: 13px; color: var(--fg);">Page 1</span>
-      <button id="btn-jobs-next" disabled>Next</button>
     </div>
     <table id="jobs-table">
       <thead><tr><th>#</th><th>Type</th><th>File</th><th>Status</th><th class="num">Saved</th><th>Log</th></tr></thead>
       <tbody></tbody>
     </table>
     <div id="jobs-empty" class="empty" hidden>No jobs yet.</div>
+    <div class="pagination-bar" id="jobs-pagination">
+      <button id="btn-jobs-prev" disabled>Previous</button>
+      <span id="jobs-page-info">Page 1</span>
+      <button id="btn-jobs-next" disabled>Next</button>
+    </div>
   </section>
 </main>
 
