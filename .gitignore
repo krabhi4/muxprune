@@ -12,3 +12,6 @@
 
 # OS noise
 .DS_Store
+
+# Local agent configs
+/.agents/
