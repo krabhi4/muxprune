@@ -591,7 +591,6 @@ func (s *Store) DeleteJob(id int64) error {
 	return nil
 }
 
-
 // FailInterrupted marks jobs left 'running' by a previous process as failed.
 func (s *Store) FailInterrupted() (int64, error) {
 	res, err := s.db.Exec(`UPDATE jobs SET status='failed', log='interrupted by restart', finished_at=?

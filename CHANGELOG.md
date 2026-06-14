@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-06-15
+
+### Added
+- Multi-view client-side URL routing and pagination across Files, Libraries, and Jobs views, ensuring persistent navigation states on page refresh.
+- Persistent database-backed scanning queue converting background library scanning operations into robust `scan_library` and `scan_all` jobs processed by the runner.
+- Job cancellation capability (`POST /api/v1/jobs/{id}/cancel` and a Cancel button in the Web UI) allowing users to safely abort queued jobs.
+- Job deletion support (`DELETE /api/v1/jobs/{id}` and a Delete button in the Web UI) to remove completed/failed/cancelled jobs from the database history.
+- Upgraded Model Context Protocol (MCP) server integration with new tools: `queue_scan_job`, `queue_scan_all_job`, `cancel_job`, `delete_job`, and `list_jobs`, plus paginated and sorted outputs in `list_files`.
+
+### Changed
+- Refactored scanning logic to run entirely as queued background jobs instead of using in-memory mutex locking.
+
 ## [0.2.3] - 2026-06-15
 
 ### Added
