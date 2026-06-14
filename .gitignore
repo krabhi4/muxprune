@@ -15,3 +15,6 @@
 
 # Local agent configs
 /.agents/
+
+# Local mount directories
+/mount_hdd*/
