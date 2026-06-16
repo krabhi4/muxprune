@@ -262,3 +262,31 @@ legend { color: var(--muted); font: 600 11px var(--sans); text-transform: upperc
   font-size: 12.5px;
 }
 
+/* ---- collapsible series ---- */
+.series-header {
+  background: var(--panel2) !important;
+  font-weight: 500;
+  border-bottom: 1px solid var(--border);
+}
+.series-header:hover {
+  background: var(--raise) !important;
+}
+.toggle-icon {
+  display: inline-block;
+  width: 1.2rem;
+  color: var(--accent);
+  cursor: pointer;
+  user-select: none;
+  font-size: 11px;
+}
+.series-title {
+  cursor: pointer;
+  user-select: none;
+}
+.series-tag {
+  margin-left: 0.5rem;
+}
+.episode-row.collapsed {
+  display: none;
+}
+

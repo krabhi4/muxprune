@@ -356,6 +356,8 @@ $("#dlg-library-form").addEventListener("submit", async (e) => {
 const selection = new Set();
 let filesCache = [];
 let filesTotal = 0;
+const expandedSeries = new Set();
+let lastCheckedId = null;
 
 function badges(summary, cls) {
   return (summary || "").split(" ").filter(Boolean)
@@ -384,23 +386,8 @@ async function loadFiles() {
   filesCache = data.files || [];
   filesTotal = data.total || 0;
 
-  const tbody = $("#files-table tbody");
-  tbody.innerHTML = filesCache.map((f) => `
-    <tr data-id="${f.id}">
-      <td class="col-check"><input type="checkbox" data-id="${f.id}" ${selection.has(f.id) ? "checked" : ""}></td>
-      <td>
-        ${esc(fileLabel(f))}${f.nlink > 1 ? ' <span class="badge warn" title="Hardlinked: remux would break seeding">&#128279; hardlink</span>' : ""}
-        <div class="sub">${esc(f.path)}</div>
-      </td>
-      <td><span class="badge">${esc(f.video_codec)}</span></td>
-      <td>${badges(f.audio_summary, "audio")}</td>
-      <td>${badges(f.sub_summary, "subtitle")}</td>
-      <td>${badges(f.sidecar_summary, "sidecar")}</td>
-      <td class="num">${human(f.size)}</td>
-      <td class="num"><button data-act="open">Edit</button></td>
-    </tr>`).join("");
-  $("#files-empty").hidden = filesCache.length > 0;
-  updateSelectionUI();
+  expandedSeries.clear();
+  renderFilesTable();
 
   const totalPages = Math.ceil(filesTotal / state.filesLimit) || 1;
   if (state.filesPage > totalPages) {
@@ -411,6 +398,145 @@ async function loadFiles() {
   $("#files-page-info").textContent = `Page ${state.filesPage} of ${totalPages} (${filesTotal} total)`;
   $("#btn-files-prev").disabled = state.filesPage <= 1;
   $("#btn-files-next").disabled = state.filesPage >= totalPages;
+}
+
+function renderFilesTable() {
+  const tbody = $("#files-table tbody");
+  if (!filesCache || filesCache.length === 0) {
+    tbody.innerHTML = "";
+    $("#files-empty").hidden = false;
+    const checkAll = $("#check-all");
+    if (checkAll) {
+      checkAll.checked = false;
+      checkAll.indeterminate = false;
+    }
+    updateSelectionUI();
+    return;
+  }
+  $("#files-empty").hidden = true;
+
+  const groups = [];
+  const seriesMap = new Map();
+
+  for (const f of filesCache) {
+    if (f.kind === "tv" && f.series) {
+      if (!seriesMap.has(f.series)) {
+        const grp = {
+          type: "series",
+          name: f.series,
+          files: [],
+          size: 0,
+          video_codecs: new Set(),
+          audio_summaries: new Set(),
+          sub_summaries: new Set(),
+          sidecar_summaries: new Set(),
+        };
+        seriesMap.set(f.series, grp);
+        groups.push(grp);
+      }
+      const grp = seriesMap.get(f.series);
+      grp.files.push(f);
+      grp.size += f.size;
+      if (f.video_codec) grp.video_codecs.add(f.video_codec);
+      if (f.audio_summary) f.audio_summary.split(" ").filter(Boolean).forEach(x => grp.audio_summaries.add(x));
+      if (f.sub_summary) f.sub_summary.split(" ").filter(Boolean).forEach(x => grp.sub_summaries.add(x));
+      if (f.sidecar_summary) f.sidecar_summary.split(" ").filter(Boolean).forEach(x => grp.sidecar_summaries.add(x));
+    } else {
+      groups.push({
+        type: "file",
+        file: f
+      });
+    }
+  }
+
+  let html = [];
+  for (const g of groups) {
+    if (g.type === "series") {
+      const seriesKey = g.name;
+      const isExpanded = expandedSeries.has(seriesKey);
+      const allChecked = g.files.every(f => selection.has(f.id));
+      const someChecked = !allChecked && g.files.some(f => selection.has(f.id));
+      
+      const vCodecs = [...g.video_codecs].join(", ");
+      const aSummary = [...g.audio_summaries].join(" ");
+      const sSummary = [...g.sub_summaries].join(" ");
+      const scSummary = [...g.sidecar_summaries].join(" ");
+
+      html.push(`
+        <tr class="series-header" data-series="${esc(seriesKey)}">
+          <td class="col-check">
+            <input type="checkbox" class="series-check" data-series="${esc(seriesKey)}" ${allChecked ? "checked" : ""} ${someChecked ? 'data-indeterminate="true"' : ""}>
+          </td>
+          <td>
+            <span class="toggle-icon">${isExpanded ? "&#9660;" : "&#9654;"}</span>
+            <span class="series-title"><strong>${esc(g.name)}</strong></span>
+            <span class="badge series-tag">${g.files.length} episodes</span>
+          </td>
+          <td><span class="badge">${esc(vCodecs)}</span></td>
+          <td>${badges(aSummary, "audio")}</td>
+          <td>${badges(sSummary, "subtitle")}</td>
+          <td>${badges(scSummary, "sidecar")}</td>
+          <td class="num">${human(g.size)}</td>
+          <td class="num"></td>
+        </tr>
+      `);
+
+      for (const f of g.files) {
+        const label = f.episode ? `${f.episode}${f.title ? " - " + f.title : ""}` : (f.title || f.path.split("/").pop());
+        html.push(`
+          <tr class="episode-row ${!isExpanded ? "collapsed" : ""}" data-series="${esc(seriesKey)}" data-id="${f.id}">
+            <td class="col-check">
+              <input type="checkbox" data-id="${f.id}" ${selection.has(f.id) ? "checked" : ""}>
+            </td>
+            <td style="padding-left: 2rem;">
+              ${esc(label)}${f.nlink > 1 ? ' <span class="badge warn" title="Hardlinked: remux would break seeding">&#128279; hardlink</span>' : ""}
+              <div class="sub">${esc(f.path)}</div>
+            </td>
+            <td><span class="badge">${esc(f.video_codec)}</span></td>
+            <td>${badges(f.audio_summary, "audio")}</td>
+            <td>${badges(f.sub_summary, "subtitle")}</td>
+            <td>${badges(f.sidecar_summary, "sidecar")}</td>
+            <td class="num">${human(f.size)}</td>
+            <td class="num"><button data-act="open">Edit</button></td>
+          </tr>
+        `);
+      }
+    } else {
+      const f = g.file;
+      html.push(`
+        <tr data-id="${f.id}">
+          <td class="col-check"><input type="checkbox" data-id="${f.id}" ${selection.has(f.id) ? "checked" : ""}></td>
+          <td>
+            ${esc(fileLabel(f))}${f.nlink > 1 ? ' <span class="badge warn" title="Hardlinked: remux would break seeding">&#128279; hardlink</span>' : ""}
+            <div class="sub">${esc(f.path)}</div>
+          </td>
+          <td><span class="badge">${esc(f.video_codec)}</span></td>
+          <td>${badges(f.audio_summary, "audio")}</td>
+          <td>${badges(f.sub_summary, "subtitle")}</td>
+          <td>${badges(f.sidecar_summary, "sidecar")}</td>
+          <td class="num">${human(f.size)}</td>
+          <td class="num"><button data-act="open">Edit</button></td>
+        </tr>
+      `);
+    }
+  }
+
+  tbody.innerHTML = html.join("");
+
+  // Update indeterminate checkboxes
+  $$(".series-check[data-indeterminate='true']").forEach(cb => {
+    cb.indeterminate = true;
+  });
+
+  // Update check-all checkbox state
+  const allCacheChecked = filesCache.length > 0 && filesCache.every(f => selection.has(f.id));
+  const checkAll = $("#check-all");
+  if (checkAll) {
+    checkAll.checked = allCacheChecked;
+    checkAll.indeterminate = !allCacheChecked && filesCache.some(f => selection.has(f.id));
+  }
+
+  updateSelectionUI();
 }
 
 let qTimer;
@@ -451,10 +577,64 @@ $("#btn-files-next").addEventListener("click", () => {
 $("#files-table").addEventListener("click", (e) => {
   const check = e.target.closest('input[type="checkbox"]');
   if (check && check.id !== "check-all") {
-    check.checked ? selection.add(+check.dataset.id) : selection.delete(+check.dataset.id);
-    updateSelectionUI();
+    if (check.classList.contains("series-check")) {
+      const seriesName = check.dataset.series;
+      const groupFiles = filesCache.filter(f => f.kind === "tv" && f.series === seriesName);
+      const checked = check.checked;
+      for (const f of groupFiles) {
+        if (checked) {
+          selection.add(f.id);
+        } else {
+          selection.delete(f.id);
+        }
+      }
+      lastCheckedId = null;
+      renderFilesTable();
+    } else {
+      const currentId = +check.dataset.id;
+      const checked = check.checked;
+
+      if (e.shiftKey && lastCheckedId !== null) {
+        const checkboxes = $$('#files-table tbody input[type="checkbox"]:not(.series-check)');
+        const lastIdx = checkboxes.findIndex(cb => +cb.dataset.id === lastCheckedId);
+        const currentIdx = checkboxes.findIndex(cb => +cb.dataset.id === currentId);
+
+        if (lastIdx !== -1 && currentIdx !== -1) {
+          const start = Math.min(lastIdx, currentIdx);
+          const end = Math.max(lastIdx, currentIdx);
+
+          for (let i = start; i <= end; i++) {
+            const cb = checkboxes[i];
+            const id = +cb.dataset.id;
+            if (checked) {
+              selection.add(id);
+            } else {
+              selection.delete(id);
+            }
+          }
+        }
+      } else {
+        checked ? selection.add(currentId) : selection.delete(currentId);
+      }
+
+      lastCheckedId = currentId;
+      renderFilesTable();
+    }
     return;
   }
+
+  const seriesRow = e.target.closest("tr.series-header");
+  if (seriesRow && !e.target.closest("button") && !e.target.closest("input")) {
+    const seriesName = seriesRow.dataset.series;
+    if (expandedSeries.has(seriesName)) {
+      expandedSeries.delete(seriesName);
+    } else {
+      expandedSeries.add(seriesName);
+    }
+    renderFilesTable();
+    return;
+  }
+
   const row = e.target.closest("tr[data-id]");
   if (row && (e.target.closest("button") || !e.target.closest("input")))
     openFileDialog(+row.dataset.id);
@@ -462,8 +642,7 @@ $("#files-table").addEventListener("click", (e) => {
 
 $("#check-all").addEventListener("change", (e) => {
   filesCache.forEach((f) => (e.target.checked ? selection.add(f.id) : selection.delete(f.id)));
-  $$('#files-table tbody input[type="checkbox"]').forEach((c) => (c.checked = e.target.checked));
-  updateSelectionUI();
+  renderFilesTable();
 });
 
 function updateSelectionUI() {
