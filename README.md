@@ -14,6 +14,7 @@ Unlike heavy transcode pipelines (such as Tdarr or Unmanic) that focus on re-enc
 - **Hardlink Safety Guard:** Detects if a media file has multiple hardlinks (e.g. still seeding in your torrent client). Skips or warns by default to prevent breaking links or doubling space.
 - **Recycle Bin:** Deleted sidecar files can be moved to a temporary recycle folder and automatically purged after a configurable number of days.
 - **Incremental Scanner:** Crawls TV and Movie roots, parses basenames best-effort, tracks file size, modification times, link counts, and caches metadata in a CGO-free SQLite database.
+- **Automatic Library Monitoring:** Keeps the catalog in sync without manual scans via a configurable per-library periodic auto-scan (default every 6 hours), plus an optional real-time `fsnotify` watcher that triggers a debounced rescan on local filesystem changes. The watcher auto-disables on network/union mounts (NFS/SMB/CIFS/FUSE) where inotify is unreliable, falling back to the periodic scan. A built-in guard means a transiently-unmounted volume can never wipe your catalog.
 - **Webhooks:** Integrates with Sonarr/Radarr "On Import" webhooks to instantly scan newly imported files.
 - **REST API & Utilitarian Web UI:** Utility-driven dark mode UI to browse inventory, inspect streams, queue single or batch jobs, see dry-run size estimates, and track active queue status.
 - **Developer CLI Mode:** Can be run directly as a CLI tool (`muxprune inspect` / `muxprune strip`) without launching the web server.
@@ -37,6 +38,8 @@ services:
       # - MUXPRUNE_API_KEY=your-secret-api-key # Requires X-Api-Key header on API endpoints
       # - MUXPRUNE_WORKERS=1                   # Concurrent remux jobs (1 is recommended for HDDs/SSDs)
       # - MUXPRUNE_RECYCLE_DAYS=7              # Keep deleted sidecars in config/recycle (0 = delete permanently)
+      # - MUXPRUNE_AUTOSCAN_DEFAULT=21600     # Default auto-scan interval (sec) for new libraries (0 = off, min 60)
+      # - MUXPRUNE_WATCH=1                     # Real-time fsnotify watcher (0 = periodic scans only)
     volumes:
       - ./config:/config
       - /data/media/tv:/tv
@@ -56,6 +59,8 @@ services:
 | `MUXPRUNE_CONFIG` | Directory for the SQLite database, logs, and recycle folder | `/config` (Docker) or `./data` |
 | `MUXPRUNE_WORKERS` | Number of concurrent background remux workers | `1` |
 | `MUXPRUNE_RECYCLE_DAYS` | Number of days to keep deleted sidecar subtitles in recycle | `7` |
+| `MUXPRUNE_AUTOSCAN_DEFAULT` | Default auto-scan interval (seconds) for newly added libraries; `0` disables, minimum `60` | `21600` (6h) |
+| `MUXPRUNE_WATCH` | Enable the real-time filesystem watcher (`0`/`false`/`off` uses periodic scans only) | `1` (on) |
 | `MUXPRUNE_API_KEY` | Optional authorization key for the REST API | (none, open API) |
 | `PUID` / `PGID` | User and Group ID mapping to match media folder ownership | `1000`/`1000` |
 | `UMASK` | File permissions mask for newly created files | `022` |

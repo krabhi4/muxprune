@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-06-21
+
+### Added
+- Automatic library monitoring so the catalog stays in sync without manual scans. Each library gets a configurable periodic auto-scan (default every 6 hours) plus an optional real-time filesystem watcher (`fsnotify`) that triggers a debounced rescan when files change. The watcher auto-disables on network/union mounts (NFS/SMB/CIFS/FUSE) where inotify is unreliable and falls back to the periodic scan; watcher failures surface as a status instead of dying silently.
+- Per-library `auto_scan_interval` and `watch_enabled` settings, exposed in the Web UI library dialog (interval dropdown + watch toggle) and the libraries list (auto-scan cadence + live watch-status badge: watching/polling/disabled/error). New env vars `MUXPRUNE_AUTOSCAN_DEFAULT` (default interval for new libraries) and `MUXPRUNE_WATCH` (global watcher kill-switch).
+
+### Fixed
+- Mass-deletion guard for scans: a scan now aborts (instead of pruning) when a library root is missing or unreadable, and skips pruning when a completed walk finds zero files while records still exist. This stops a transiently-unmounted volume from wiping the library catalog, which matters now that scans can run automatically.
+
 ## [0.3.1] - 2026-06-16
 
 ### Added

@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"github.com/krabhi4/muxprune/internal/probe"
 	"github.com/krabhi4/muxprune/internal/scan"
 	"github.com/krabhi4/muxprune/internal/store"
+	"github.com/krabhi4/muxprune/internal/watch"
 )
 
 func env(key, def string) string {
@@ -40,6 +42,40 @@ func envInt(key string, def int) int {
 		return n
 	}
 	return def
+}
+
+func envBool(key string, def bool) bool {
+	switch strings.ToLower(os.Getenv(key)) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	}
+	return def
+}
+
+func startMonitor(ctx context.Context, st *store.Store, runner *jobs.Runner, hub *api.Hub) *watch.Monitor {
+	var enqMu sync.Mutex
+	enqueue := func(libID int64) {
+		enqMu.Lock()
+		defer enqMu.Unlock()
+		if active, _ := st.IsScanActive(libID); active {
+			return
+		}
+		lib, err := st.GetLibrary(libID)
+		if err != nil || lib == nil {
+			return
+		}
+		if _, err := st.CreateJob("scan_library", 0, lib.Path, jobs.ScanLibraryPayload{LibraryID: libID}); err == nil {
+			runner.Wake()
+		}
+	}
+	m := watch.New(st, enqueue, watch.Config{
+		WatchDisabled: !envBool("MUXPRUNE_WATCH", true),
+		Events:        hub,
+	})
+	go m.Start(ctx)
+	return m
 }
 
 func main() {
@@ -101,12 +137,14 @@ func runServe(args []string) error {
 	}
 	scanner := &scan.Scanner{Store: st, Prober: prober, Events: hub}
 	runner := &jobs.Runner{Store: st, Engine: eng, Scanner: scanner, Events: hub}
-	srv := &api.Server{Store: st, Scanner: scanner, Runner: runner, Engine: eng, Hub: hub, APIKey: *apiKey}
+	srv := &api.Server{Store: st, Scanner: scanner, Runner: runner, Engine: eng, Hub: hub, APIKey: *apiKey,
+		DefaultAutoScanInterval: envInt("MUXPRUNE_AUTOSCAN_DEFAULT", 21600)}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	go runner.Start(ctx, *workers)
+	srv.Monitor = startMonitor(ctx, st, runner, hub)
 	if *recycleDays > 0 {
 		go purgeLoop(ctx, eng, time.Duration(*recycleDays)*24*time.Hour)
 	}
@@ -155,12 +193,14 @@ func runMCP(args []string) error {
 	}
 	scanner := &scan.Scanner{Store: st, Prober: prober, Events: hub}
 	runner := &jobs.Runner{Store: st, Engine: eng, Scanner: scanner, Events: hub}
-	srv := &api.Server{Store: st, Scanner: scanner, Runner: runner, Engine: eng, Hub: hub}
+	srv := &api.Server{Store: st, Scanner: scanner, Runner: runner, Engine: eng, Hub: hub,
+		DefaultAutoScanInterval: envInt("MUXPRUNE_AUTOSCAN_DEFAULT", 21600)}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	go runner.Start(ctx, *workers)
+	srv.Monitor = startMonitor(ctx, st, runner, hub)
 	if *recycleDays > 0 {
 		go purgeLoop(ctx, eng, time.Duration(*recycleDays)*24*time.Hour)
 	}

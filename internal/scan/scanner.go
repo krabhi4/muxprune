@@ -51,6 +51,10 @@ func (sc *Scanner) notify(p progress) {
 // sidecar subtitles, and prunes records for files that disappeared.
 // Probe results are cached by (path, size, mtime).
 func (sc *Scanner) ScanLibrary(ctx context.Context, lib *store.Library) error {
+	if info, err := os.Stat(lib.Path); err != nil || !info.IsDir() {
+		return fmt.Errorf("library path not accessible (skipping scan to avoid data loss): %s", lib.Path)
+	}
+
 	start := time.Now().Unix()
 
 	type entry struct {
@@ -119,6 +123,14 @@ func (sc *Scanner) ScanLibrary(ctx context.Context, lib *store.Library) error {
 
 	if err := sc.Store.TouchFilesBulk(pendingIDs); err != nil {
 		return err
+	}
+
+	if len(videos) == 0 {
+		if existing, err := sc.Store.CountFilesByLibrary(lib.ID); err == nil && existing > 0 {
+			fmt.Fprintf(os.Stderr, "scan: library %d: found 0 files but %d records exist; skipping prune\n", lib.ID, existing)
+			sc.notify(progress{LibraryID: lib.ID, Phase: "done", Done: 0, Total: 0})
+			return nil
+		}
 	}
 
 	pruned, err := sc.Store.PruneFiles(lib.ID, start)

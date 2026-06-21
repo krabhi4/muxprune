@@ -127,6 +127,9 @@ td.num, th.num { text-align: right; white-space: nowrap; font-family: var(--mono
 .status.skipped { color: var(--amber); background: #292117; border: 1px solid #514023; }
 .status.running { color: var(--teal); background: #1c2522; border: 1px solid #324740; }
 .status.queued { color: var(--muted); background: var(--panel2); border: 1px solid var(--border); }
+.status.watching { color: var(--accent); background: #20241a; border: 1px solid #3a4226; }
+.status.polling { color: var(--muted); background: var(--panel2); border: 1px solid var(--border); }
+.status.disabled { color: var(--faint); background: var(--panel2); border: 1px solid var(--border-soft); }
 
 .empty { padding: 3rem; text-align: center; color: var(--faint); border: 1px dashed var(--border); margin-top: .5rem; }
 .scan-progress {

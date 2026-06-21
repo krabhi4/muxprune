@@ -25,13 +25,21 @@ import (
 //go:embed web/static
 var webFS embed.FS
 
+type LibraryMonitor interface {
+	Reconcile()
+	Status(libraryID int64) string
+}
+
 type Server struct {
 	Store   *store.Store
 	Scanner *scan.Scanner
 	Runner  *jobs.Runner
 	Engine  *engine.Engine
 	Hub     *Hub
+	Monitor LibraryMonitor
 	APIKey  string // empty disables auth
+
+	DefaultAutoScanInterval int
 
 	mcpMu       sync.Mutex
 	mcpSessions map[string]chan []byte
@@ -158,51 +166,103 @@ func (s *Server) handleBrowse(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type libraryView struct {
+	store.Library
+	WatchStatus string `json:"watch_status"`
+}
+
+func (s *Server) libraryView(l store.Library) libraryView {
+	v := libraryView{Library: l}
+	if s.Monitor != nil {
+		v.WatchStatus = s.Monitor.Status(l.ID)
+	}
+	return v
+}
+
+func (s *Server) reconcileMonitor() {
+	if s.Monitor != nil {
+		s.Monitor.Reconcile()
+	}
+}
+
 func (s *Server) handleListLibraries(w http.ResponseWriter, r *http.Request) {
 	libs, err := s.Store.ListLibraries()
 	if err != nil {
 		writeErr(w, 500, err)
 		return
 	}
-	if libs == nil {
-		libs = []store.Library{}
+	views := make([]libraryView, 0, len(libs))
+	for _, l := range libs {
+		views = append(views, s.libraryView(l))
 	}
-	writeJSON(w, 200, libs)
+	writeJSON(w, 200, views)
 }
 
-func decodeLibrary(r *http.Request) (*store.Library, error) {
-	var l store.Library
-	if err := json.NewDecoder(r.Body).Decode(&l); err != nil {
+type libraryRequest struct {
+	Name             string `json:"name"`
+	Path             string `json:"path"`
+	Kind             string `json:"kind"`
+	HardlinkPolicy   string `json:"hardlink_policy"`
+	AutoScanInterval *int   `json:"auto_scan_interval"`
+	WatchEnabled     *bool  `json:"watch_enabled"`
+}
+
+func sanitizeInterval(secs int) int {
+	if secs <= 0 {
+		return 0
+	}
+	if secs < 60 {
+		return 60
+	}
+	return secs
+}
+
+func decodeLibraryReq(r *http.Request) (*libraryRequest, error) {
+	var req libraryRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		return nil, err
 	}
-	l.Path = filepath.Clean(l.Path)
-	if l.Name == "" {
-		l.Name = filepath.Base(l.Path)
+	req.Path = filepath.Clean(req.Path)
+	if req.Name == "" {
+		req.Name = filepath.Base(req.Path)
 	}
-	if !slices.Contains([]string{"tv", "movie", "other"}, l.Kind) {
-		l.Kind = "other"
+	if !slices.Contains([]string{"tv", "movie", "other"}, req.Kind) {
+		req.Kind = "other"
 	}
-	if !slices.Contains([]string{"skip", "proceed"}, l.HardlinkPolicy) {
-		l.HardlinkPolicy = "skip"
+	if !slices.Contains([]string{"skip", "proceed"}, req.HardlinkPolicy) {
+		req.HardlinkPolicy = "skip"
 	}
-	info, err := os.Stat(l.Path)
+	info, err := os.Stat(req.Path)
 	if err != nil || !info.IsDir() {
-		return nil, fmt.Errorf("path is not an accessible directory: %s", l.Path)
+		return nil, fmt.Errorf("path is not an accessible directory: %s", req.Path)
 	}
-	return &l, nil
+	return &req, nil
 }
 
 func (s *Server) handleAddLibrary(w http.ResponseWriter, r *http.Request) {
-	l, err := decodeLibrary(r)
+	req, err := decodeLibraryReq(r)
 	if err != nil {
 		writeErr(w, 400, err)
 		return
+	}
+	interval := s.DefaultAutoScanInterval
+	if req.AutoScanInterval != nil {
+		interval = *req.AutoScanInterval
+	}
+	watch := true
+	if req.WatchEnabled != nil {
+		watch = *req.WatchEnabled
+	}
+	l := &store.Library{
+		Name: req.Name, Path: req.Path, Kind: req.Kind, HardlinkPolicy: req.HardlinkPolicy,
+		AutoScanInterval: sanitizeInterval(interval), WatchEnabled: watch,
 	}
 	if err := s.Store.AddLibrary(l); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
-	writeJSON(w, 201, l)
+	s.reconcileMonitor()
+	writeJSON(w, 201, s.libraryView(*l))
 }
 
 func (s *Server) handleUpdateLibrary(w http.ResponseWriter, r *http.Request) {
@@ -211,17 +271,38 @@ func (s *Server) handleUpdateLibrary(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
-	l, err := decodeLibrary(r)
+	existing, err := s.Store.GetLibrary(id)
+	if err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	if existing == nil {
+		writeErr(w, 404, errors.New("library not found"))
+		return
+	}
+	req, err := decodeLibraryReq(r)
 	if err != nil {
 		writeErr(w, 400, err)
 		return
 	}
-	l.ID = id
+	l := &store.Library{
+		ID: id, Name: req.Name, Path: req.Path, Kind: req.Kind, HardlinkPolicy: req.HardlinkPolicy,
+		AutoScanInterval:   existing.AutoScanInterval,
+		WatchEnabled:       existing.WatchEnabled,
+		LastScanFinishedAt: existing.LastScanFinishedAt,
+	}
+	if req.AutoScanInterval != nil {
+		l.AutoScanInterval = sanitizeInterval(*req.AutoScanInterval)
+	}
+	if req.WatchEnabled != nil {
+		l.WatchEnabled = *req.WatchEnabled
+	}
 	if err := s.Store.UpdateLibrary(l); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
-	writeJSON(w, 200, l)
+	s.reconcileMonitor()
+	writeJSON(w, 200, s.libraryView(*l))
 }
 
 func (s *Server) handleDeleteLibrary(w http.ResponseWriter, r *http.Request) {
@@ -234,6 +315,7 @@ func (s *Server) handleDeleteLibrary(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err)
 		return
 	}
+	s.reconcileMonitor()
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 

@@ -39,7 +39,10 @@ CREATE TABLE IF NOT EXISTS libraries (
 	name TEXT NOT NULL,
 	path TEXT NOT NULL UNIQUE,
 	kind TEXT NOT NULL DEFAULT 'other',
-	hardlink_policy TEXT NOT NULL DEFAULT 'skip'
+	hardlink_policy TEXT NOT NULL DEFAULT 'skip',
+	auto_scan_interval INTEGER NOT NULL DEFAULT 21600,
+	watch_enabled INTEGER NOT NULL DEFAULT 1,
+	last_scan_finished_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS media_files (
 	id INTEGER PRIMARY KEY,
@@ -90,22 +93,53 @@ CREATE TABLE IF NOT EXISTS settings (
 	key TEXT PRIMARY KEY,
 	value TEXT NOT NULL
 );`)
-	return err
+	if err != nil {
+		return err
+	}
+	for _, col := range []string{
+		"auto_scan_interval INTEGER NOT NULL DEFAULT 21600",
+		"watch_enabled INTEGER NOT NULL DEFAULT 1",
+		"last_scan_finished_at INTEGER NOT NULL DEFAULT 0",
+	} {
+		if err := s.addColumn("libraries", col); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) addColumn(table, colDef string) error {
+	_, err := s.db.Exec("ALTER TABLE " + table + " ADD COLUMN " + colDef)
+	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
+	return nil
 }
 
 // ---- libraries ----
 
 type Library struct {
-	ID             int64  `json:"id"`
-	Name           string `json:"name"`
-	Path           string `json:"path"`
-	Kind           string `json:"kind"`            // tv, movie, other
-	HardlinkPolicy string `json:"hardlink_policy"` // skip, proceed
+	ID                 int64  `json:"id"`
+	Name               string `json:"name"`
+	Path               string `json:"path"`
+	Kind               string `json:"kind"`            // tv, movie, other
+	HardlinkPolicy     string `json:"hardlink_policy"` // skip, proceed
+	AutoScanInterval   int    `json:"auto_scan_interval"`
+	WatchEnabled       bool   `json:"watch_enabled"`
+	LastScanFinishedAt int64  `json:"last_scan_finished_at"`
+}
+
+const libraryCols = `id,name,path,kind,hardlink_policy,auto_scan_interval,watch_enabled,last_scan_finished_at`
+
+func scanLibrary(sc interface{ Scan(...any) error }, l *Library) error {
+	return sc.Scan(&l.ID, &l.Name, &l.Path, &l.Kind, &l.HardlinkPolicy,
+		&l.AutoScanInterval, &l.WatchEnabled, &l.LastScanFinishedAt)
 }
 
 func (s *Store) AddLibrary(l *Library) error {
-	res, err := s.db.Exec(`INSERT INTO libraries(name,path,kind,hardlink_policy) VALUES(?,?,?,?)`,
-		l.Name, l.Path, l.Kind, l.HardlinkPolicy)
+	res, err := s.db.Exec(`INSERT INTO libraries(name,path,kind,hardlink_policy,auto_scan_interval,watch_enabled)
+		VALUES(?,?,?,?,?,?)`,
+		l.Name, l.Path, l.Kind, l.HardlinkPolicy, l.AutoScanInterval, l.WatchEnabled)
 	if err != nil {
 		return err
 	}
@@ -114,8 +148,9 @@ func (s *Store) AddLibrary(l *Library) error {
 }
 
 func (s *Store) UpdateLibrary(l *Library) error {
-	_, err := s.db.Exec(`UPDATE libraries SET name=?,path=?,kind=?,hardlink_policy=? WHERE id=?`,
-		l.Name, l.Path, l.Kind, l.HardlinkPolicy, l.ID)
+	_, err := s.db.Exec(`UPDATE libraries SET name=?,path=?,kind=?,hardlink_policy=?,
+		auto_scan_interval=?,watch_enabled=? WHERE id=?`,
+		l.Name, l.Path, l.Kind, l.HardlinkPolicy, l.AutoScanInterval, l.WatchEnabled, l.ID)
 	return err
 }
 
@@ -124,10 +159,14 @@ func (s *Store) DeleteLibrary(id int64) error {
 	return err
 }
 
+func (s *Store) MarkLibraryScanned(id, ts int64) error {
+	_, err := s.db.Exec(`UPDATE libraries SET last_scan_finished_at=? WHERE id=?`, ts, id)
+	return err
+}
+
 func (s *Store) GetLibrary(id int64) (*Library, error) {
 	l := &Library{}
-	err := s.db.QueryRow(`SELECT id,name,path,kind,hardlink_policy FROM libraries WHERE id=?`, id).
-		Scan(&l.ID, &l.Name, &l.Path, &l.Kind, &l.HardlinkPolicy)
+	err := scanLibrary(s.db.QueryRow(`SELECT `+libraryCols+` FROM libraries WHERE id=?`, id), l)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -135,7 +174,7 @@ func (s *Store) GetLibrary(id int64) (*Library, error) {
 }
 
 func (s *Store) ListLibraries() ([]Library, error) {
-	rows, err := s.db.Query(`SELECT id,name,path,kind,hardlink_policy FROM libraries ORDER BY name`)
+	rows, err := s.db.Query(`SELECT ` + libraryCols + ` FROM libraries ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -143,12 +182,18 @@ func (s *Store) ListLibraries() ([]Library, error) {
 	var out []Library
 	for rows.Next() {
 		var l Library
-		if err := rows.Scan(&l.ID, &l.Name, &l.Path, &l.Kind, &l.HardlinkPolicy); err != nil {
+		if err := scanLibrary(rows, &l); err != nil {
 			return nil, err
 		}
 		out = append(out, l)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) CountFilesByLibrary(libraryID int64) (int64, error) {
+	var n int64
+	err := s.db.QueryRow(`SELECT count(*) FROM media_files WHERE library_id=?`, libraryID).Scan(&n)
+	return n, err
 }
 
 // ---- media files ----

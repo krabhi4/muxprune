@@ -205,8 +205,10 @@ func (r *Runner) execute(ctx context.Context, job *store.Job) (status, log strin
 		if lib == nil {
 			return "failed", fmt.Sprintf("library %d not found", p.LibraryID), 0
 		}
-		if err := r.Scanner.ScanLibrary(ctx, lib); err != nil {
-			return "failed", err.Error(), 0
+		serr := r.Scanner.ScanLibrary(ctx, lib)
+		r.Store.MarkLibraryScanned(lib.ID, time.Now().Unix())
+		if serr != nil {
+			return "failed", serr.Error(), 0
 		}
 		return "done", fmt.Sprintf("scanned library: %s", lib.Name), 0
 
@@ -215,17 +217,27 @@ func (r *Runner) execute(ctx context.Context, job *store.Job) (status, log strin
 		if err != nil {
 			return "failed", "db error: " + err.Error(), 0
 		}
-		var scanned []string
+		var scanned, failedLibs []string
 		for i := range libs {
 			if ctx.Err() != nil {
 				return "failed", ctx.Err().Error(), 0
 			}
-			if err := r.Scanner.ScanLibrary(ctx, &libs[i]); err != nil {
-				return "failed", fmt.Sprintf("library %s: %v", libs[i].Name, err), 0
+			serr := r.Scanner.ScanLibrary(ctx, &libs[i])
+			r.Store.MarkLibraryScanned(libs[i].ID, time.Now().Unix())
+			if serr != nil {
+				failedLibs = append(failedLibs, fmt.Sprintf("%s: %v", libs[i].Name, serr))
+				continue
 			}
 			scanned = append(scanned, libs[i].Name)
 		}
-		return "done", fmt.Sprintf("scanned libraries: %s", strings.Join(scanned, ", ")), 0
+		log := "scanned: " + strings.Join(scanned, ", ")
+		if len(failedLibs) > 0 {
+			log += " | failed: " + strings.Join(failedLibs, "; ")
+		}
+		if len(scanned) == 0 && len(failedLibs) > 0 {
+			return "failed", log, 0
+		}
+		return "done", log, 0
 
 	default:
 		return "failed", "unknown job type " + job.Type, 0

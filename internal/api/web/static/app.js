@@ -195,6 +195,24 @@ async function loadLibraries() {
   renderLibraries();
 }
 
+function intervalLabel(secs) {
+  if (!secs || secs <= 0) return "Off";
+  const map = { 900: "15m", 1800: "30m", 3600: "1h", 21600: "6h", 43200: "12h", 86400: "Daily" };
+  if (map[secs]) return map[secs];
+  if (secs % 3600 === 0) return secs / 3600 + "h";
+  if (secs % 60 === 0) return secs / 60 + "m";
+  return secs + "s";
+}
+
+function watchBadge(lib) {
+  const s = lib.watch_status || (lib.watch_enabled ? "polling" : "disabled");
+  let cls = "polling", label = s;
+  if (s === "watching") cls = "watching";
+  else if (s === "disabled") cls = "disabled";
+  else if (s.startsWith("error")) { cls = "failed"; label = "error"; }
+  return `<span class="status ${cls}" title="${esc(s)}">${esc(label)}</span>`;
+}
+
 function renderLibraries() {
   const totalPages = Math.ceil(libraries.length / state.librariesLimit) || 1;
   if (state.librariesPage > totalPages) {
@@ -211,6 +229,8 @@ function renderLibraries() {
     <tr data-id="${l.id}">
       <td>${esc(l.name)}</td><td class="muted">${esc(l.path)}</td><td>${esc(l.kind)}</td>
       <td>${esc(l.hardlink_policy)}</td>
+      <td>${esc(intervalLabel(l.auto_scan_interval))}</td>
+      <td>${watchBadge(l)}</td>
       <td class="num">
         <button data-act="scan">Scan</button>
         <button data-act="edit">Edit</button>
@@ -264,7 +284,14 @@ function openLibraryDialog(lib) {
   form.reset();
   $("#dlg-library-title").textContent = lib ? "Edit library" : "Add library";
   form.dataset.id = lib ? lib.id : "";
-  if (lib) for (const k of ["name", "path", "kind", "hardlink_policy"]) form[k].value = lib[k];
+  if (lib) {
+    for (const k of ["name", "path", "kind", "hardlink_policy"]) form[k].value = lib[k];
+    form.auto_scan_interval.value = String(lib.auto_scan_interval ?? 21600);
+    form.watch_enabled.checked = !!lib.watch_enabled;
+  } else {
+    form.auto_scan_interval.value = "21600";
+    form.watch_enabled.checked = true;
+  }
   $("#dlg-library").showModal();
 }
 
@@ -343,7 +370,15 @@ $("#dlg-library-form").addEventListener("submit", async (e) => {
   const form = e.target;
   if (e.submitter && e.submitter.value === "cancel") return;
   e.preventDefault();
-  const body = Object.fromEntries(new FormData(form));
+  const fd = new FormData(form);
+  const body = {
+    name: fd.get("name"),
+    path: fd.get("path"),
+    kind: fd.get("kind"),
+    hardlink_policy: fd.get("hardlink_policy"),
+    auto_scan_interval: parseInt(fd.get("auto_scan_interval"), 10) || 0,
+    watch_enabled: fd.get("watch_enabled") === "on",
+  };
   try {
     if (form.dataset.id) await api(`/libraries/${form.dataset.id}`, { method: "PUT", body });
     else await api("/libraries", { method: "POST", body });
@@ -1008,10 +1043,14 @@ function connectEvents() {
       box.textContent = `Scanning library ${d.library_id}: ${d.done}/${d.total} ${d.path || ""}`;
     }
   });
+  es.addEventListener("watch", () => {
+    if (currentView() === "libraries") loadLibraries();
+  });
   es.addEventListener("job", (e) => {
     const d = JSON.parse(e.data);
     if (currentView() === "jobs") loadJobs();
     if (d.status && d.status !== "running" && d.status !== "queued") {
+      if (d.type === "scan_library" || d.type === "scan_all") $("#scan-progress").hidden = true;
       toast(`Job #${d.id} ${d.status}${d.bytes_saved ? " · saved " + human(d.bytes_saved) : ""}`,
         d.status === "failed");
       if (currentView() === "files") loadFiles();

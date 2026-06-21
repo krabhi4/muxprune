@@ -88,7 +88,7 @@
       <button id="btn-scan-all">Scan all</button>
     </div>
     <table id="libraries-table">
-      <thead><tr><th>Name</th><th>Path</th><th>Kind</th><th>Hardlink policy</th><th></th></tr></thead>
+      <thead><tr><th>Name</th><th>Path</th><th>Kind</th><th>Hardlink policy</th><th>Auto-scan</th><th>Watch</th><th></th></tr></thead>
       <tbody></tbody>
     </table>
     <div id="libraries-empty" class="empty" hidden>
@@ -176,6 +176,18 @@
         <option value="proceed">Proceed (breaks seed hardlinks)</option>
       </select>
     </label>
+    <label>Auto-scan interval
+      <select name="auto_scan_interval">
+        <option value="0">Off</option>
+        <option value="900">Every 15 minutes</option>
+        <option value="1800">Every 30 minutes</option>
+        <option value="3600">Hourly</option>
+        <option value="21600">Every 6 hours</option>
+        <option value="43200">Every 12 hours</option>
+        <option value="86400">Daily</option>
+      </select>
+    </label>
+    <label class="checkline"><input type="checkbox" name="watch_enabled"> Real-time watch (local filesystems only; auto-disabled on network mounts)</label>
     <div class="dialog-actions">
       <button value="cancel" formnovalidate>Cancel</button>
       <span class="spacer"></span>
