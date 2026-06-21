@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/krabhi4/muxprune/internal/probe"
 )
@@ -168,6 +169,45 @@ func TestDryRun(t *testing.T) {
 	after, _ := os.Stat(path)
 	if before.Size() != after.Size() || before.ModTime() != after.ModTime() {
 		t.Error("dry run modified the file")
+	}
+}
+
+func TestRemuxAdvancesModTime(t *testing.T) {
+	dir := t.TempDir()
+	path := makeFixture(t, dir)
+	p := &probe.Prober{}
+	e := &Engine{Prober: p}
+	ctx := context.Background()
+
+	res, err := p.Probe(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jpnIdx := -1
+	for _, s := range res.Streams {
+		if s.Lang == "jpn" {
+			jpnIdx = s.Index
+		}
+	}
+	if jpnIdx < 0 {
+		t.Fatal("fixture missing jpn audio track")
+	}
+
+	backdate := time.Now().Add(-72 * time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(path, backdate, backdate); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := e.RemoveTracks(ctx, path, RemovalSpec{AudioIdx: []int{jpnIdx}}, Options{}); err != nil {
+		t.Fatalf("remux failed: %v", err)
+	}
+
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().After(backdate) {
+		t.Fatalf("remux must advance mtime so downstream scanners detect the change: mtime=%v, backdated original=%v", after.ModTime(), backdate)
 	}
 }
 

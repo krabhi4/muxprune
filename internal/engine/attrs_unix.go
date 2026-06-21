@@ -25,7 +25,7 @@ func freeSpace(dir string) (uint64, error) {
 	return uint64(st.Bavail) * uint64(st.Bsize), nil
 }
 
-// preserveAttrs copies mode, mtime and ownership from the original onto the
+// preserveAttrs copies mode and ownership from the original onto the
 // temp file before the rename, so the replacement is invisible to PUID/PGID
 // based setups. Chown failures (non-root) are ignored.
 func preserveAttrs(tmp string, orig fs.FileInfo) {
@@ -33,5 +33,4 @@ func preserveAttrs(tmp string, orig fs.FileInfo) {
 	if st, ok := orig.Sys().(*syscall.Stat_t); ok {
 		os.Chown(tmp, int(st.Uid), int(st.Gid))
 	}
-	os.Chtimes(tmp, orig.ModTime(), orig.ModTime())
 }

@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-06-21
+
+### Fixed
+- Remux no longer restores the original modification time onto the rewritten file. Previously, after pruning tracks, muxprune reset the file's `mtime` back to its pre-prune value, so external media servers (Jellyfin, Sonarr, Plex) never detected the content change: they kept displaying the stale, pre-prune track/subtitle list and, in Jellyfin's case, kept serving already-extracted (now-removed) subtitle tracks from its own cache. The remuxed file now keeps a fresh modification time so downstream scanners re-probe and reflect the real track layout. File ownership and permissions (`PUID`/`PGID`) are still preserved.
+
 ## [0.4.0] - 2026-06-21
 
 ### Added
