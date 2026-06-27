@@ -170,7 +170,10 @@ func (s *Store) GetLibrary(id int64) (*Library, error) {
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
-	return l, err
+	if err != nil {
+		return nil, err
+	}
+	return l, nil
 }
 
 func (s *Store) ListLibraries() ([]Library, error) {
@@ -385,8 +388,8 @@ func (s *Store) ListFiles(f FileFilter) ([]MediaFile, int, error) {
 		args = append(args, f.Kind)
 	}
 	if f.Query != "" {
-		where = append(where, "(path LIKE ? OR series LIKE ? OR title LIKE ?)")
-		q := "%" + f.Query + "%"
+		where = append(where, `(path LIKE ? ESCAPE '\' OR series LIKE ? ESCAPE '\' OR title LIKE ? ESCAPE '\')`)
+		q := "%" + escapeLike(f.Query) + "%"
 		args = append(args, q, q, q)
 	}
 	if f.Hardlinks == "yes" {
@@ -721,13 +724,23 @@ func (s *Store) GetJob(id int64) (*Job, error) {
 func (s *Store) Stats() (map[string]int64, error) {
 	out := map[string]int64{}
 	var saved, files, queued int64
-	s.db.QueryRow(`SELECT coalesce(sum(bytes_saved),0) FROM jobs WHERE status='done'`).Scan(&saved)
-	s.db.QueryRow(`SELECT count(*) FROM media_files`).Scan(&files)
-	s.db.QueryRow(`SELECT count(*) FROM jobs WHERE status IN ('queued','running')`).Scan(&queued)
+	if err := s.db.QueryRow(`SELECT coalesce(sum(bytes_saved),0) FROM jobs WHERE status='done'`).Scan(&saved); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM media_files`).Scan(&files); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM jobs WHERE status IN ('queued','running')`).Scan(&queued); err != nil {
+		return nil, err
+	}
 	out["bytes_saved"] = saved
 	out["files"] = files
 	out["active_jobs"] = queued
 	return out, nil
+}
+
+func escapeLike(s string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
 }
 
 // ---- settings ----
