@@ -117,10 +117,13 @@ func (e *Engine) EditMetadata(ctx context.Context, path string, edits []Metadata
 		}
 		args = append(args, "--edit", "track:="+strconv.Itoa(st.MkvID))
 		if edit.Language != "" {
+			if !validLanguageTag(edit.Language) {
+				return nil, fmt.Errorf("invalid language tag %q", edit.Language)
+			}
 			args = append(args, "--set", "language="+edit.Language)
 		}
-		if edit.Title != "" {
-			args = append(args, "--set", "name="+edit.Title)
+		if title := stripControl(edit.Title); title != "" {
+			args = append(args, "--set", "name="+title)
 		}
 		if edit.Default != nil {
 			args = append(args, "--set", "flag-default="+boolFlag(*edit.Default))
@@ -146,6 +149,35 @@ func boolFlag(v bool) string {
 		return "1"
 	}
 	return "0"
+}
+
+func validLanguageTag(s string) bool {
+	subtags := strings.Split(s, "-")
+	for _, sub := range subtags {
+		if sub == "" {
+			return false
+		}
+		for _, r := range sub {
+			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
+				return false
+			}
+		}
+	}
+	for _, r := range subtags[0] {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {
+			return false
+		}
+	}
+	return true
+}
+
+func stripControl(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 // ReorderSpec describes the desired track order for a Matroska remux.
@@ -234,7 +266,7 @@ func (e *Engine) ReorderTracks(ctx context.Context, path string, spec ReorderSpe
 	tmp := tempPath(dir, base, ext)
 	defer os.Remove(tmp)
 
-	args := []string{"-q", "-o", tmp, "--track-order", trackOrder, path}
+	args := []string{"-q", "-o", tmp, "--track-order", trackOrder, "--", path}
 	cmdline := e.mkvmerge + " " + strings.Join(args, " ")
 	tool, full := wrapNice(e.mkvmerge, args)
 	cmd := exec.CommandContext(ctx, tool, full...)
@@ -288,33 +320,8 @@ func (e *Engine) MergeTracks(ctx context.Context, path string, spec MergeSpec) (
 		return nil, errors.New("track merging requires a Matroska file")
 	}
 
-	absPath, err := filepath.Abs(path)
-	if err != nil {
+	if err := validateExternalFiles(path, spec.ExternalFiles); err != nil {
 		return nil, err
-	}
-
-	// Verify each external file exists, is not the input file, and is not a duplicate.
-	seenExt := map[string]bool{}
-	for _, ext := range spec.ExternalFiles {
-		absExt, err := filepath.Abs(ext)
-		if err != nil {
-			return nil, fmt.Errorf("external file %s path: %w", ext, err)
-		}
-		if absExt == absPath {
-			return nil, fmt.Errorf("cannot merge a file into itself: %s", ext)
-		}
-		if seenExt[absExt] {
-			return nil, fmt.Errorf("duplicate external file specified: %s", ext)
-		}
-		seenExt[absExt] = true
-
-		fi, err := os.Stat(ext)
-		if err != nil {
-			return nil, fmt.Errorf("external file %s: %w", ext, err)
-		}
-		if fi.IsDir() {
-			return nil, fmt.Errorf("external file %s is a directory", ext)
-		}
 	}
 
 	info, err := os.Stat(path)
@@ -331,7 +338,7 @@ func (e *Engine) MergeTracks(ctx context.Context, path string, spec MergeSpec) (
 	tmp := tempPath(dir, base, ext)
 	defer os.Remove(tmp)
 
-	args := []string{"-q", "-o", tmp, path}
+	args := []string{"-q", "-o", tmp, "--", path}
 	args = append(args, spec.ExternalFiles...)
 	cmdline := e.mkvmerge + " " + strings.Join(args, " ")
 	tool, full := wrapNice(e.mkvmerge, args)
@@ -363,6 +370,39 @@ func (e *Engine) MergeTracks(ctx context.Context, path string, spec MergeSpec) (
 		Tool: "mkvmerge", Command: cmdline,
 		BytesSaved: saved,
 	}, nil
+}
+
+func validateExternalFiles(path string, files []string) error {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	seenExt := map[string]bool{}
+	for _, ext := range files {
+		absExt, err := filepath.Abs(ext)
+		if err != nil {
+			return fmt.Errorf("external file %s path: %w", ext, err)
+		}
+		if absExt == absPath {
+			return fmt.Errorf("cannot merge a file into itself: %s", ext)
+		}
+		if seenExt[absExt] {
+			return fmt.Errorf("duplicate external file specified: %s", ext)
+		}
+		seenExt[absExt] = true
+
+		fi, err := os.Stat(ext)
+		if err != nil {
+			return fmt.Errorf("external file %s: %w", ext, err)
+		}
+		if fi.IsDir() {
+			return fmt.Errorf("external file %s is a directory", ext)
+		}
+		if b := filepath.Base(ext); strings.HasPrefix(b, "-") || strings.HasPrefix(b, "@") {
+			return fmt.Errorf("refusing external file %s: name begins with %q", ext, b[:1])
+		}
+	}
+	return nil
 }
 
 // verifyMerge checks that a merge output has at least as many tracks as the
@@ -547,7 +587,7 @@ func mkvmergeArgs(res *probe.Result, spec RemovalSpec) []string {
 			args = append(args, "--subtitle-tracks", strings.Join(ids, ","))
 		}
 	}
-	return append(args, res.Path)
+	return append(args, "--", res.Path)
 }
 
 func ffmpegArgs(res *probe.Result, spec RemovalSpec) []string {
