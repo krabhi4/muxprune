@@ -31,6 +31,15 @@ type Scanner struct {
 	Store  *store.Store
 	Prober *probe.Prober
 	Events Notifier
+
+	MaxPruneRatio float64
+}
+
+func (sc *Scanner) pruneMaxRatio() float64 {
+	if sc.MaxPruneRatio > 0 && sc.MaxPruneRatio <= 1 {
+		return sc.MaxPruneRatio
+	}
+	return 0.2
 }
 
 type progress struct {
@@ -65,8 +74,10 @@ func (sc *Scanner) ScanLibrary(ctx context.Context, lib *store.Library) error {
 	dirFiles := map[string][]string{}         // dir -> all file names (for sidecar matching)
 	dirSizes := map[string]map[string]int64{} // dir -> filename -> size
 
+	var walkErrSeen bool
 	err := filepath.WalkDir(lib.Path, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
+			walkErrSeen = true
 			return nil // unreadable subtree: skip, do not abort the scan
 		}
 		if ctx.Err() != nil {
@@ -111,7 +122,9 @@ func (sc *Scanner) ScanLibrary(ctx context.Context, lib *store.Library) error {
 		dir := filepath.Dir(v.path)
 		unchanged, id, err := sc.scanOne(ctx, lib, v.path, v.info, dirFiles[dir], dirSizes[dir])
 		if err != nil {
-			// Per-file failure (corrupt file, probe error) must not kill the scan.
+			if id != 0 {
+				pendingIDs = append(pendingIDs, id)
+			}
 			fmt.Fprintf(os.Stderr, "scan: %s: %v\n", v.path, err)
 		} else if unchanged {
 			pendingIDs = append(pendingIDs, id)
@@ -131,6 +144,27 @@ func (sc *Scanner) ScanLibrary(ctx context.Context, lib *store.Library) error {
 			sc.notify(progress{LibraryID: lib.ID, Phase: "done", Done: 0, Total: 0})
 			return nil
 		}
+	}
+
+	if walkErrSeen {
+		fmt.Fprintf(os.Stderr, "scan: library %d: walk had unreadable subtrees; skipping prune to avoid data loss\n", lib.ID)
+		sc.notify(progress{LibraryID: lib.ID, Phase: "done", Done: len(videos), Total: len(videos)})
+		return nil
+	}
+
+	total, err := sc.Store.CountFilesByLibrary(lib.ID)
+	if err != nil {
+		return err
+	}
+	stale, err := sc.Store.CountStaleFiles(lib.ID, start)
+	if err != nil {
+		return err
+	}
+	if ratio := sc.pruneMaxRatio(); total > 0 && float64(stale)/float64(total) > ratio {
+		fmt.Fprintf(os.Stderr, "scan: library %d: would prune %d/%d records (>%.0f%%); skipping prune (set MUXPRUNE_PRUNE_MAX_RATIO to override)\n",
+			lib.ID, stale, total, ratio*100)
+		sc.notify(progress{LibraryID: lib.ID, Phase: "done", Done: len(videos), Total: len(videos)})
+		return nil
 	}
 
 	pruned, err := sc.Store.PruneFiles(lib.ID, start)
@@ -219,7 +253,7 @@ func (sc *Scanner) scanOne(ctx context.Context, lib *store.Library, path string,
 
 	res, err := sc.Prober.Probe(ctx, path)
 	if err != nil {
-		return false, 0, err
+		return false, id, err
 	}
 	probeJSON, err := json.Marshal(res)
 	if err != nil {

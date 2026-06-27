@@ -320,6 +320,13 @@ func (s *Store) PruneFiles(libraryID int64, scanStart int64) (int64, error) {
 	return res.RowsAffected()
 }
 
+func (s *Store) CountStaleFiles(libraryID, scanStart int64) (int64, error) {
+	var n int64
+	err := s.db.QueryRow(`SELECT count(*) FROM media_files WHERE library_id=? AND scanned_at<?`,
+		libraryID, scanStart).Scan(&n)
+	return n, err
+}
+
 func (s *Store) ReplaceSidecars(fileID int64, scs []Sidecar) error {
 	tx, err := s.db.Begin()
 	if err != nil {
