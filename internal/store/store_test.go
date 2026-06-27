@@ -8,6 +8,45 @@ import (
 	"time"
 )
 
+func TestEscapeLike(t *testing.T) {
+	cases := map[string]string{
+		"plain":      "plain",
+		"S01_E02":    `S01\_E02`,
+		"50%":        `50\%`,
+		`back\slash`: `back\\slash`,
+		"a_b%c":      `a\_b\%c`,
+	}
+	for in, want := range cases {
+		if got := escapeLike(in); got != want {
+			t.Errorf("escapeLike(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestListFiles_SearchEscapesWildcards(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	lib := &Library{Name: "L", Path: "/x", Kind: "other", HardlinkPolicy: "skip"}
+	if err := s.AddLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"/x/The_Matrix.mkv", "/x/TheXMatrix.mkv"} {
+		if err := s.UpsertMediaFile(&MediaFile{LibraryID: lib.ID, Path: p, Size: 1, Mtime: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files, total, err := s.ListFiles(FileFilter{Query: "The_Matrix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || len(files) != 1 || files[0].Path != "/x/The_Matrix.mkv" {
+		t.Errorf("query 'The_Matrix' should match only the literal underscore file, got total=%d files=%v", total, files)
+	}
+}
+
 func TestCountStaleFiles(t *testing.T) {
 	dir, err := os.MkdirTemp("", "muxprune-stale-*")
 	if err != nil {
