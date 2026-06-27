@@ -620,17 +620,19 @@ func (e *Engine) verify(ctx context.Context, in *probe.Result, spec RemovalSpec,
 			return fmt.Errorf("duration drifted: %.2fs -> %.2fs (tolerance %.2fs)", in.Duration, out.Duration, tolerance)
 		}
 	}
-	// Size floor: output must hold everything we kept. With unknown bitrates
-	// fall back to a conservative 20% floor; count+duration checks above carry
-	// most of the weight.
-	floor := int64(float64(in.Size-estimateRemoved(in, spec)) * 0.7)
-	if min := in.Size / 5; floor < min && estimateRemoved(in, spec) == 0 {
-		floor = min
-	}
+	floor := sizeFloor(in.Size, estimateRemoved(in, spec))
 	if out.Size < floor {
 		return fmt.Errorf("output suspiciously small: %d < floor %d (input %d)", out.Size, floor, in.Size)
 	}
 	return nil
+}
+
+func sizeFloor(inSize, estRemoved int64) int64 {
+	floor := int64(float64(inSize-estRemoved) * 0.7)
+	if minFloor := inSize / 10; floor < minFloor {
+		floor = minFloor
+	}
+	return floor
 }
 
 func estimateRemoved(res *probe.Result, spec RemovalSpec) int64 {
