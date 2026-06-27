@@ -24,27 +24,32 @@ func isRelevantFile(name string) bool {
 	return scan.IsSubtitleExt(ext)
 }
 
+const defaultWatchLimit = 8192
+
 type libWatcher struct {
-	libID    int64
-	root     string
-	debounce time.Duration
-	trigger  func(libID int64)
-	onStatus func(libID int64, status string)
+	libID      int64
+	root       string
+	debounce   time.Duration
+	trigger    func(libID int64)
+	onStatus   func(libID int64, status string)
+	watchLimit int
 
 	fsw    *fsnotify.Watcher
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu    sync.Mutex
-	timer *time.Timer
-	dead  bool
+	mu       sync.Mutex
+	timer    *time.Timer
+	dead     bool
+	watches  int
+	degraded bool
 }
 
 func newLibWatcher(libID int64, root string, debounce time.Duration, trigger func(int64), onStatus func(int64, string)) *libWatcher {
 	if debounce <= 0 {
 		debounce = 10 * time.Second
 	}
-	return &libWatcher{libID: libID, root: root, debounce: debounce, trigger: trigger, onStatus: onStatus}
+	return &libWatcher{libID: libID, root: root, debounce: debounce, trigger: trigger, onStatus: onStatus, watchLimit: defaultWatchLimit}
 }
 
 func (w *libWatcher) start(parent context.Context) error {
@@ -54,7 +59,9 @@ func (w *libWatcher) start(parent context.Context) error {
 	}
 	w.fsw = fsw
 	ctx, cancel := context.WithCancel(parent)
+	w.mu.Lock()
 	w.ctx, w.cancel = ctx, cancel
+	w.mu.Unlock()
 	if err := fsw.Add(w.root); err != nil {
 		w.status("error: " + err.Error())
 		fsw.Close()
@@ -66,15 +73,25 @@ func (w *libWatcher) start(parent context.Context) error {
 	return nil
 }
 
+func (w *libWatcher) ctxErr() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.ctx == nil {
+		return nil
+	}
+	return w.ctx.Err()
+}
+
 func (w *libWatcher) stop() {
 	w.mu.Lock()
 	if w.timer != nil {
 		w.timer.Stop()
 		w.timer = nil
 	}
+	cancel := w.cancel
 	w.mu.Unlock()
-	if w.cancel != nil {
-		w.cancel()
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -84,8 +101,14 @@ func (w *libWatcher) isDead() bool {
 	return w.dead
 }
 
+func (w *libWatcher) isDegraded() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.degraded
+}
+
 func (w *libWatcher) died(reason string) {
-	if w.ctx.Err() != nil {
+	if w.ctxErr() != nil {
 		return
 	}
 	w.mu.Lock()
@@ -105,9 +128,32 @@ func (w *libWatcher) addRecursive(root string) {
 		if path != root && strings.HasPrefix(d.Name(), ".") {
 			return filepath.SkipDir
 		}
-		_ = w.fsw.Add(path)
+		if !w.addWatch(path) {
+			return filepath.SkipDir
+		}
 		return nil
 	})
+}
+
+func (w *libWatcher) addWatch(path string) bool {
+	w.mu.Lock()
+	if w.watchLimit > 0 && w.watches >= w.watchLimit {
+		degraded := w.degraded
+		w.degraded = true
+		w.mu.Unlock()
+		if !degraded {
+			w.status("watch-limit")
+		}
+		return false
+	}
+	w.mu.Unlock()
+	if err := w.fsw.Add(path); err != nil {
+		return true
+	}
+	w.mu.Lock()
+	w.watches++
+	w.mu.Unlock()
+	return true
 }
 
 func (w *libWatcher) loop(ctx context.Context) {
@@ -129,7 +175,15 @@ func (w *libWatcher) loop(ctx context.Context) {
 			}
 			if err != nil {
 				w.status("error: " + err.Error())
-				_ = w.fsw.Add(w.root)
+				if addErr := w.fsw.Add(w.root); addErr != nil {
+					w.died("re-add root failed: " + addErr.Error())
+					return
+				}
+				w.mu.Lock()
+				w.watches = 0
+				w.degraded = false
+				w.mu.Unlock()
+				w.addRecursive(w.root)
 			}
 		}
 	}
@@ -165,7 +219,7 @@ func (w *libWatcher) fire() {
 	w.mu.Lock()
 	w.timer = nil
 	w.mu.Unlock()
-	if w.ctx.Err() != nil || w.isDead() {
+	if w.ctxErr() != nil || w.isDead() {
 		return
 	}
 	w.trigger(w.libID)
