@@ -971,8 +971,9 @@ async function loadJobs() {
       <td class="num">${j.bytes_saved ? human(j.bytes_saved) : ""}</td>
       <td class="sub">${esc(j.log)}</td>
       <td class="num">
-        ${j.status === "queued" ? `<button data-act="cancel">Cancel</button>` : ""}
-        ${j.status === "done" || j.status === "failed" || j.status === "skipped" ? `<button data-act="del" class="danger">Delete</button>` : ""}
+        ${j.status === "queued" || j.status === "running" ? `<button data-act="cancel">Cancel</button>` : ""}
+        ${j.status === "failed" || j.status === "skipped" || j.status === "cancelled" ? `<button data-act="retry">Retry</button>` : ""}
+        ${j.status === "done" || j.status === "failed" || j.status === "skipped" || j.status === "cancelled" ? `<button data-act="del" class="danger">Delete</button>` : ""}
       </td>
     </tr>`).join("");
   $("#jobs-empty").hidden = data.jobs.length > 0;
@@ -997,6 +998,14 @@ $("#jobs-table").addEventListener("click", async (e) => {
     try {
       await api(`/jobs/${id}/cancel`, { method: "POST" });
       toast(`Job #${id} cancelled`);
+      loadJobs();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  } else if (btn.dataset.act === "retry") {
+    try {
+      await api(`/jobs/${id}/retry`, { method: "POST" });
+      toast(`Job #${id} re-queued`);
       loadJobs();
     } catch (err) {
       toast(err.message, true);
