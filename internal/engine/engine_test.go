@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -170,6 +171,107 @@ func TestUniqueDst(t *testing.T) {
 	}
 	if _, err := os.Stat(b); err == nil {
 		t.Fatalf("second path %s should not exist yet", b)
+	}
+}
+
+func TestValidLanguageTag(t *testing.T) {
+	tests := []struct {
+		tag  string
+		want bool
+	}{
+		{"eng", true},
+		{"en", true},
+		{"pt-BR", true},
+		{"zh-Hant-HK", true},
+		{"", false},
+		{"en_US", false},
+		{"en US", false},
+		{"123", false},
+		{"en-", false},
+		{"-en", false},
+		{"en--US", false},
+		{"e\nn", false},
+		{"en;rm -rf", false},
+	}
+	for _, tc := range tests {
+		if got := validLanguageTag(tc.tag); got != tc.want {
+			t.Errorf("validLanguageTag(%q) = %v, want %v", tc.tag, got, tc.want)
+		}
+	}
+}
+
+func TestStripControl(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"Director's Cut", "Director's Cut"},
+		{"bad\x00title", "badtitle"},
+		{"line\nbreak", "linebreak"},
+		{"tab\there", "tabhere"},
+		{"del\x7fchar", "delchar"},
+		{"\x01\x02\x03", ""},
+	}
+	for _, tc := range tests {
+		if got := stripControl(tc.in); got != tc.want {
+			t.Errorf("stripControl(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestValidateExternalFilesRejectsHostile(t *testing.T) {
+	dir := t.TempDir()
+	mkv := filepath.Join(dir, "movie.mkv")
+	os.WriteFile(mkv, []byte("x"), 0o644)
+
+	dash := filepath.Join(dir, "-evil.srt")
+	at := filepath.Join(dir, "@evil.srt")
+	ok := filepath.Join(dir, "good.srt")
+	os.WriteFile(dash, []byte("x"), 0o644)
+	os.WriteFile(at, []byte("x"), 0o644)
+	os.WriteFile(ok, []byte("x"), 0o644)
+
+	tests := []struct {
+		name    string
+		files   []string
+		wantErr bool
+	}{
+		{"dash prefix", []string{dash}, true},
+		{"at prefix", []string{at}, true},
+		{"normal", []string{ok}, false},
+		{"mixed rejects", []string{ok, dash}, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateExternalFiles(mkv, tc.files)
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected error for %v, got nil", tc.files)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error for %v: %v", tc.files, err)
+			}
+		})
+	}
+}
+
+func TestMkvmergeArgsTerminator(t *testing.T) {
+	res := &probe.Result{
+		Path: "-tricky.mkv",
+		Streams: []probe.Stream{
+			{Index: 0, Type: "video", MkvID: 0},
+			{Index: 1, Type: "audio", MkvID: 1},
+			{Index: 2, Type: "audio", MkvID: 2},
+		},
+	}
+	args := mkvmergeArgs(res, RemovalSpec{AudioIdx: []int{2}})
+	if len(args) < 2 || args[len(args)-1] != res.Path || args[len(args)-2] != "--" {
+		t.Fatalf("expected args to end with %q then path, got %v", "--", args)
+	}
+	full := reorderOutput("mkvmerge", args, "out.mkv")
+	di := slices.Index(full, "--")
+	pi := slices.Index(full, res.Path)
+	if di < 0 || pi < 0 || di != pi-1 {
+		t.Fatalf("expected -- immediately before input path, got %v", full)
 	}
 }
 
