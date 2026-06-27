@@ -1,10 +1,41 @@
 package store
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+func TestCountStaleFiles(t *testing.T) {
+	dir, err := os.MkdirTemp("", "muxprune-stale-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	s, err := Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	lib := &Library{Name: "L", Path: "/x", Kind: "other", HardlinkPolicy: "skip"}
+	if err := s.AddLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		f := &MediaFile{LibraryID: lib.ID, Path: fmt.Sprintf("/x/%d.mkv", i), Size: 1, Mtime: 1}
+		if err := s.UpsertMediaFile(f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if stale, err := s.CountStaleFiles(lib.ID, time.Now().Unix()+100); err != nil || stale != 3 {
+		t.Fatalf("stale (future cutoff) = %d, err=%v, want 3", stale, err)
+	}
+	if stale, _ := s.CountStaleFiles(lib.ID, time.Now().Unix()-100); stale != 0 {
+		t.Errorf("stale (past cutoff) = %d, want 0", stale)
+	}
+}
 
 func TestStore_ListFiles_FilteringAndSorting(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "muxprune-store-test-*")
