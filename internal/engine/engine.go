@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/krabhi4/muxprune/internal/probe"
@@ -62,6 +63,8 @@ type Engine struct {
 	ffmpeg      string
 	mkvmerge    string
 	mkvpropedit string
+
+	locks keyedMutex
 }
 
 func (e *Engine) resolve() {
@@ -80,6 +83,8 @@ func (e *Engine) HasMkvpropedit() bool { e.resolve(); return e.mkvpropedit != ""
 // metadata-only changes (language, title, default/forced flags).
 func (e *Engine) EditMetadata(ctx context.Context, path string, edits []MetadataEdit) (*Result, error) {
 	e.resolve()
+	unlock := e.locks.lock(absKey(path))
+	defer unlock()
 	if e.mkvpropedit == "" {
 		return nil, errors.New("mkvpropedit not found in PATH")
 	}
@@ -157,6 +162,8 @@ type MergeSpec struct {
 // using mkvmerge's --track-order flag.
 func (e *Engine) ReorderTracks(ctx context.Context, path string, spec ReorderSpec) (*Result, error) {
 	e.resolve()
+	unlock := e.locks.lock(absKey(path))
+	defer unlock()
 	if e.mkvmerge == "" {
 		return nil, errors.New("mkvmerge not found in PATH")
 	}
@@ -224,7 +231,7 @@ func (e *Engine) ReorderTracks(ctx context.Context, path string, spec ReorderSpe
 
 	ext := filepath.Ext(path)
 	base := strings.TrimSuffix(filepath.Base(path), ext)
-	tmp := filepath.Join(dir, "."+base+".muxprune.tmp"+ext)
+	tmp := tempPath(dir, base, ext)
 	defer os.Remove(tmp)
 
 	args := []string{"-q", "-o", tmp, "--track-order", trackOrder, path}
@@ -264,6 +271,8 @@ func (e *Engine) ReorderTracks(ctx context.Context, path string, spec ReorderSpe
 // using mkvmerge.
 func (e *Engine) MergeTracks(ctx context.Context, path string, spec MergeSpec) (*Result, error) {
 	e.resolve()
+	unlock := e.locks.lock(absKey(path))
+	defer unlock()
 	if e.mkvmerge == "" {
 		return nil, errors.New("mkvmerge not found in PATH")
 	}
@@ -319,7 +328,7 @@ func (e *Engine) MergeTracks(ctx context.Context, path string, spec MergeSpec) (
 
 	ext := filepath.Ext(path)
 	base := strings.TrimSuffix(filepath.Base(path), ext)
-	tmp := filepath.Join(dir, "."+base+".muxprune.tmp"+ext)
+	tmp := tempPath(dir, base, ext)
 	defer os.Remove(tmp)
 
 	args := []string{"-q", "-o", tmp, path}
@@ -394,6 +403,8 @@ func (e *Engine) verifyMerge(ctx context.Context, in *probe.Result, tmp string) 
 // RemoveTracks losslessly remuxes path without the specified streams.
 func (e *Engine) RemoveTracks(ctx context.Context, path string, spec RemovalSpec, opts Options) (*Result, error) {
 	e.resolve()
+	unlock := e.locks.lock(absKey(path))
+	defer unlock()
 	if spec.Empty() {
 		return nil, errors.New("nothing to remove")
 	}
@@ -425,7 +436,7 @@ func (e *Engine) RemoveTracks(ctx context.Context, path string, spec RemovalSpec
 	}
 	ext := filepath.Ext(path)
 	base := strings.TrimSuffix(filepath.Base(path), ext)
-	tmp := filepath.Join(dir, "."+base+".muxprune.tmp"+ext)
+	tmp := tempPath(dir, base, ext)
 	cmdline := tool + " " + strings.Join(args, " ")
 
 	if opts.DryRun {
@@ -741,6 +752,55 @@ func moveFile(src, dst string) error {
 		return err
 	}
 	return os.Remove(src)
+}
+
+var tmpSeq atomic.Int64
+
+func tempPath(dir, base, ext string) string {
+	n := tmpSeq.Add(1)
+	return filepath.Join(dir, fmt.Sprintf(".%s.muxprune.tmp.%d-%d%s", base, os.Getpid(), n, ext))
+}
+
+func absKey(path string) string {
+	if abs, err := filepath.Abs(path); err == nil {
+		return abs
+	}
+	return path
+}
+
+type keyedMutex struct {
+	mu sync.Mutex
+	m  map[string]*refMutex
+}
+
+type refMutex struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func (k *keyedMutex) lock(key string) func() {
+	k.mu.Lock()
+	if k.m == nil {
+		k.m = make(map[string]*refMutex)
+	}
+	rm := k.m[key]
+	if rm == nil {
+		rm = &refMutex{}
+		k.m[key] = rm
+	}
+	rm.refs++
+	k.mu.Unlock()
+
+	rm.mu.Lock()
+	return func() {
+		rm.mu.Unlock()
+		k.mu.Lock()
+		rm.refs--
+		if rm.refs == 0 {
+			delete(k.m, key)
+		}
+		k.mu.Unlock()
+	}
 }
 
 func tail(s string, n int) string {
