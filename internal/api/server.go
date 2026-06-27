@@ -2,6 +2,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -39,11 +40,16 @@ type Server struct {
 	Monitor LibraryMonitor
 	APIKey  string // empty disables auth
 
+	WebhookSecret string
+	BrowseRoots   []string
+
 	DefaultAutoScanInterval int
 
 	mcpMu       sync.Mutex
 	mcpSessions map[string]chan []byte
 }
+
+const sessionCookie = "mp_session"
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -79,6 +85,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/jobs/{id}", s.handleDeleteJob)
 	mux.HandleFunc("GET /api/v1/events", s.Hub.ServeSSE)
 	mux.HandleFunc("POST /api/v1/webhooks/arr", s.handleArrWebhook)
+	mux.HandleFunc("POST /api/v1/auth/session", s.handleAuthSession)
 
 	mux.HandleFunc("GET /sse", s.handleMCPSSE)
 	mux.HandleFunc("GET /api/v1/mcp/sse", s.handleMCPSSE)
@@ -87,25 +94,66 @@ func (s *Server) Handler() http.Handler {
 	static, _ := fs.Sub(webFS, "web/static")
 	mux.Handle("GET /", http.FileServerFS(static))
 
-	return s.auth(mux)
+	return s.wrap(s.auth(mux))
 }
 
-// auth enforces the optional API key on /api/* (static UI stays open; it
-// holds no data). Accepts X-Api-Key header or ?apikey= for webhook senders.
+func constantTimeEqual(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+func protectedPath(path string) bool {
+	return strings.HasPrefix(path, "/api/") || path == "/sse"
+}
+
+func (s *Server) authenticated(r *http.Request) bool {
+	if key := r.Header.Get("X-Api-Key"); key != "" {
+		return constantTimeEqual(key, s.APIKey)
+	}
+	if c, err := r.Cookie(sessionCookie); err == nil {
+		return constantTimeEqual(c.Value, s.APIKey)
+	}
+	return false
+}
+
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.APIKey != "" && strings.HasPrefix(r.URL.Path, "/api/") {
-			key := r.Header.Get("X-Api-Key")
-			if key == "" {
-				key = r.URL.Query().Get("apikey")
+		if s.APIKey != "" && protectedPath(r.URL.Path) && r.URL.Path != "/api/v1/health" {
+			if r.URL.Path == "/api/v1/webhooks/arr" && s.WebhookSecret != "" &&
+				constantTimeEqual(r.Header.Get("X-Webhook-Secret"), s.WebhookSecret) {
+				next.ServeHTTP(w, r)
+				return
 			}
-			if key != s.APIKey {
+			if !s.authenticated(r) {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid api key"})
 				return
 			}
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) wrap(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
+		w.Header().Set("Content-Security-Policy",
+			"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'self'; form-action 'self'")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    s.APIKey,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   2592000,
+	})
+	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -140,6 +188,11 @@ func (s *Server) handleBrowse(w http.ResponseWriter, r *http.Request) {
 	}
 	path = filepath.Clean(path)
 
+	if len(s.BrowseRoots) > 0 && !s.pathAllowed(path) {
+		writeErr(w, 403, errors.New("path is outside the allowed roots"))
+		return
+	}
+
 	entries, err := os.ReadDir(path)
 	if err != nil {
 		writeErr(w, 400, err)
@@ -164,6 +217,16 @@ func (s *Server) handleBrowse(w http.ResponseWriter, r *http.Request) {
 		"parent":      parent,
 		"directories": dirs,
 	})
+}
+
+func (s *Server) pathAllowed(path string) bool {
+	for _, root := range s.BrowseRoots {
+		root = filepath.Clean(root)
+		if path == root || strings.HasPrefix(path+string(filepath.Separator), root+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 type libraryView struct {

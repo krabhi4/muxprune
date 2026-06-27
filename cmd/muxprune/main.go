@@ -146,6 +146,8 @@ func runServe(args []string) error {
 		MaxPruneRatio: envFloat("MUXPRUNE_PRUNE_MAX_RATIO", 0.2)}
 	runner := &jobs.Runner{Store: st, Engine: eng, Scanner: scanner, Events: hub}
 	srv := &api.Server{Store: st, Scanner: scanner, Runner: runner, Engine: eng, Hub: hub, APIKey: *apiKey,
+		WebhookSecret:           env("MUXPRUNE_WEBHOOK_SECRET", ""),
+		BrowseRoots:             browseRoots(),
 		DefaultAutoScanInterval: envInt("MUXPRUNE_AUTOSCAN_DEFAULT", 21600)}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -157,7 +159,24 @@ func runServe(args []string) error {
 		go purgeLoop(ctx, eng, time.Duration(*recycleDays)*24*time.Hour)
 	}
 
-	httpSrv := &http.Server{Addr: fmt.Sprintf(":%d", *port), Handler: srv.Handler()}
+	bind := env("MUXPRUNE_BIND", "")
+	if bind == "" {
+		if *apiKey == "" {
+			bind = "127.0.0.1"
+			fmt.Println("muxprune: WARNING api key is empty; API is UNAUTHENTICATED and bound to loopback only (set MUXPRUNE_API_KEY, or MUXPRUNE_BIND to override)")
+		} else {
+			bind = "0.0.0.0"
+		}
+	}
+
+	httpSrv := &http.Server{
+		Addr:              fmt.Sprintf("%s:%d", bind, *port),
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -165,12 +184,26 @@ func runServe(args []string) error {
 		httpSrv.Shutdown(shutdownCtx)
 	}()
 
-	fmt.Printf("muxprune %s listening on :%d (config: %s, mkvmerge: %v)\n",
-		version, *port, *configDir, prober.HasMkvmerge())
+	fmt.Printf("muxprune %s listening on %s (config: %s, mkvmerge: %v)\n",
+		version, httpSrv.Addr, *configDir, prober.HasMkvmerge())
 	if err := httpSrv.ListenAndServe(); err != http.ErrServerClosed {
 		return err
 	}
 	return nil
+}
+
+func browseRoots() []string {
+	raw := env("MUXPRUNE_BROWSE_ROOTS", "")
+	if raw == "" {
+		return nil
+	}
+	var roots []string
+	for _, p := range strings.Split(raw, ":") {
+		if p = strings.TrimSpace(p); p != "" {
+			roots = append(roots, p)
+		}
+	}
+	return roots
 }
 
 func runMCP(args []string) error {
@@ -203,6 +236,8 @@ func runMCP(args []string) error {
 		MaxPruneRatio: envFloat("MUXPRUNE_PRUNE_MAX_RATIO", 0.2)}
 	runner := &jobs.Runner{Store: st, Engine: eng, Scanner: scanner, Events: hub}
 	srv := &api.Server{Store: st, Scanner: scanner, Runner: runner, Engine: eng, Hub: hub,
+		WebhookSecret:           env("MUXPRUNE_WEBHOOK_SECRET", ""),
+		BrowseRoots:             browseRoots(),
 		DefaultAutoScanInterval: envInt("MUXPRUNE_AUTOSCAN_DEFAULT", 21600)}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

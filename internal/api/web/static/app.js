@@ -16,6 +16,14 @@ function human(b) {
 
 let apiKey = localStorage.getItem("muxprune_api_key") || "";
 
+async function ensureSession() {
+  if (!apiKey) return;
+  await fetch("/api/v1/auth/session", {
+    method: "POST",
+    headers: { "X-Api-Key": apiKey },
+  }).catch(() => {});
+}
+
 async function api(path, opts = {}) {
   const headers = { ...(opts.headers || {}) };
   if (apiKey) headers["X-Api-Key"] = apiKey;
@@ -29,6 +37,7 @@ async function api(path, opts = {}) {
     if (key) {
       apiKey = key;
       localStorage.setItem("muxprune_api_key", key);
+      await ensureSession();
       return api(path, opts);
     }
   }
@@ -1028,8 +1037,7 @@ $("#btn-jobs-next").addEventListener("click", () => {
 
 // ---- live events ----
 function connectEvents() {
-  const url = "/api/v1/events" + (apiKey ? "?apikey=" + encodeURIComponent(apiKey) : "");
-  const es = new EventSource(url);
+  const es = new EventSource("/api/v1/events");
   es.addEventListener("scan", (e) => {
     const d = JSON.parse(e.data);
     const box = $("#scan-progress");
@@ -1063,8 +1071,10 @@ function connectEvents() {
 // ---- boot ----
 parseURL();
 syncInputsToState();
-loadLibraries().then(() => {
-  refresh();
-}).catch((e) => toast(e.message, true));
-loadStats();
-connectEvents();
+ensureSession().then(() => {
+  loadLibraries().then(() => {
+    refresh();
+  }).catch((e) => toast(e.message, true));
+  loadStats();
+  connectEvents();
+});

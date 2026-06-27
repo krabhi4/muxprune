@@ -757,7 +757,6 @@ func (s *Server) handleMCPSSE(w http.ResponseWriter, r *http.Request) {
 		s.mcpMu.Lock()
 		delete(s.mcpSessions, sessionID)
 		s.mcpMu.Unlock()
-		close(ch)
 	}()
 
 	// Send initial endpoint event. This tells the client where to send POST messages.
