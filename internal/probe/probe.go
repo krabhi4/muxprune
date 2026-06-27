@@ -108,8 +108,24 @@ func (p *Prober) Probe(ctx context.Context, path string) (*Result, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ffprobe %s: %w (%s)", path, err, exitDetail(err))
 	}
+	res, err := ParseFFprobe(out, path)
+	if err != nil {
+		return nil, err
+	}
+	if res.IsMatroska() && p.mkvmerge != "" {
+		if err := p.attachMkvIDs(ctx, res); err != nil {
+			// Non-fatal: engine falls back to ffmpeg for this file.
+			for i := range res.Streams {
+				res.Streams[i].MkvID = -1
+			}
+		}
+	}
+	return res, nil
+}
+
+func ParseFFprobe(data []byte, path string) (*Result, error) {
 	var raw ffprobeOut
-	if err := json.Unmarshal(out, &raw); err != nil {
+	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("ffprobe %s: bad json: %w", path, err)
 	}
 	res := &Result{Path: path, Format: raw.Format.FormatName}
@@ -141,13 +157,8 @@ func (p *Prober) Probe(ctx context.Context, path string) (*Result, error) {
 		}
 		res.Streams = append(res.Streams, st)
 	}
-	if res.IsMatroska() && p.mkvmerge != "" {
-		if err := p.attachMkvIDs(ctx, res); err != nil {
-			// Non-fatal: engine falls back to ffmpeg for this file.
-			for i := range res.Streams {
-				res.Streams[i].MkvID = -1
-			}
-		}
+	if len(res.Streams) == 0 {
+		return nil, fmt.Errorf("ffprobe %s: no streams found (corrupt or unsupported container)", path)
 	}
 	return res, nil
 }
