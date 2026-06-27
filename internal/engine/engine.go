@@ -675,7 +675,7 @@ func (e *Engine) DeleteSidecar(path string, dryRun bool) (*Result, error) {
 		if err := os.MkdirAll(e.RecycleDir, 0o755); err != nil {
 			return nil, err
 		}
-		dst := filepath.Join(e.RecycleDir,
+		dst := uniqueDst(e.RecycleDir,
 			time.Now().UTC().Format("20060102-150405")+"_"+filepath.Base(path))
 		if err := moveFile(path, dst); err != nil {
 			return nil, err
@@ -727,8 +727,18 @@ func isSubtitlePath(path string) bool {
 	return subtitleExts[strings.ToLower(filepath.Ext(path))]
 }
 
-// moveFile renames, falling back to copy+delete across filesystems
-// (the recycle dir usually lives on the /config mount, not the media mount).
+func uniqueDst(dir, name string) string {
+	dst := filepath.Join(dir, name)
+	ext := filepath.Ext(name)
+	stem := strings.TrimSuffix(name, ext)
+	for i := 1; ; i++ {
+		if _, err := os.Stat(dst); os.IsNotExist(err) {
+			return dst
+		}
+		dst = filepath.Join(dir, fmt.Sprintf("%s_%d%s", stem, i, ext))
+	}
+}
+
 func moveFile(src, dst string) error {
 	if err := os.Rename(src, dst); err == nil {
 		return nil
@@ -738,17 +748,22 @@ func moveFile(src, dst string) error {
 		return err
 	}
 	defer in.Close()
-	out, err := os.Create(dst)
+	tmp := dst + ".part"
+	out, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
 	if _, err := io.Copy(out, in); err != nil {
 		out.Close()
-		os.Remove(dst)
+		os.Remove(tmp)
 		return err
 	}
 	if err := out.Close(); err != nil {
-		os.Remove(dst)
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
 		return err
 	}
 	return os.Remove(src)
