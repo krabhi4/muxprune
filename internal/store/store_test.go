@@ -47,6 +47,31 @@ func TestListFiles_SearchEscapesWildcards(t *testing.T) {
 	}
 }
 
+func TestRetryJob(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	j, err := s.CreateJob("remux", 0, "/x/a.mkv", map[string]any{"audio_idx": []int{1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RetryJob(j.ID); err == nil {
+		t.Fatal("a queued job should not be retryable")
+	}
+	if err := s.FinishJob(j.ID, "failed", "boom", 0); err != nil {
+		t.Fatal(err)
+	}
+	nj, err := s.RetryJob(j.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nj.ID == j.ID || nj.Status != "queued" || nj.Type != "remux" || nj.FilePath != "/x/a.mkv" {
+		t.Errorf("retry produced unexpected job: %+v", nj)
+	}
+}
+
 func TestCountStaleFiles(t *testing.T) {
 	dir, err := os.MkdirTemp("", "muxprune-stale-*")
 	if err != nil {
@@ -358,13 +383,13 @@ func TestStore_CancelJob(t *testing.T) {
 		t.Fatalf("failed to cancel job: %v", err)
 	}
 
-	// Verify status is failed and log is cancelled
+	// Verify status is cancelled and log is cancelled
 	j2, err := s.GetJob(job.ID)
 	if err != nil || j2 == nil {
 		t.Fatalf("failed to get job: %v", err)
 	}
-	if j2.Status != "failed" {
-		t.Errorf("expected status 'failed', got %q", j2.Status)
+	if j2.Status != "cancelled" {
+		t.Errorf("expected status 'cancelled', got %q", j2.Status)
 	}
 	if j2.Log != "cancelled by user" {
 		t.Errorf("expected log 'cancelled by user', got %q", j2.Log)
