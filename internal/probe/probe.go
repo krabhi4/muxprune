@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Stream struct {
@@ -50,9 +51,18 @@ func (r *Result) StreamsOfType(t string) []Stream {
 
 // Prober shells out to ffprobe/mkvmerge. Binary paths are resolved once.
 type Prober struct {
+	Timeout time.Duration
+
 	once     sync.Once
 	ffprobe  string
 	mkvmerge string
+}
+
+func (p *Prober) timeout() time.Duration {
+	if p.Timeout > 0 {
+		return p.Timeout
+	}
+	return 60 * time.Second
 }
 
 func (p *Prober) resolve() {
@@ -91,6 +101,8 @@ func (p *Prober) Probe(ctx context.Context, path string) (*Result, error) {
 	if p.ffprobe == "" {
 		return nil, fmt.Errorf("ffprobe not found in PATH")
 	}
+	ctx, cancel := context.WithTimeout(ctx, p.timeout())
+	defer cancel()
 	out, err := exec.CommandContext(ctx, p.ffprobe,
 		"-v", "error", "-print_format", "json", "-show_format", "-show_streams", path).Output()
 	if err != nil {
