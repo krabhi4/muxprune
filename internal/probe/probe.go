@@ -104,7 +104,7 @@ func (p *Prober) Probe(ctx context.Context, path string) (*Result, error) {
 	ctx, cancel := context.WithTimeout(ctx, p.timeout())
 	defer cancel()
 	out, err := exec.CommandContext(ctx, p.ffprobe,
-		"-v", "error", "-print_format", "json", "-show_format", "-show_streams", path).Output()
+		"-v", "error", "-print_format", "json", "-show_format", "-show_streams", safePathArg(path)).Output()
 	if err != nil {
 		return nil, fmt.Errorf("ffprobe %s: %w (%s)", path, err, exitDetail(err))
 	}
@@ -165,16 +165,32 @@ func ParseFFprobe(data []byte, path string) (*Result, error) {
 
 type mkvIdentify struct {
 	Tracks []struct {
-		ID   int    `json:"id"`
-		Type string `json:"type"` // video, audio, subtitles
+		ID         int    `json:"id"`
+		Type       string `json:"type"` // video, audio, subtitles
+		Properties struct {
+			Language string `json:"language"`
+			CodecID  string `json:"codec_id"`
+		} `json:"properties"`
 	} `json:"tracks"`
+}
+
+type mkvTrack struct {
+	id   int
+	lang string
+}
+
+func safePathArg(path string) string {
+	if !strings.HasPrefix(path, "/") {
+		return "./" + path
+	}
+	return path
 }
 
 // attachMkvIDs aligns mkvmerge tracks to ffprobe streams. Both list tracks in
 // container order, but ffprobe additionally reports attachments/data streams,
 // so alignment is done per type position, not by raw index.
 func (p *Prober) attachMkvIDs(ctx context.Context, res *Result) error {
-	out, err := exec.CommandContext(ctx, p.mkvmerge, "-J", res.Path).Output()
+	out, err := exec.CommandContext(ctx, p.mkvmerge, "-J", "--", safePathArg(res.Path)).Output()
 	if err != nil {
 		return fmt.Errorf("mkvmerge -J: %w", err)
 	}
@@ -182,33 +198,48 @@ func (p *Prober) attachMkvIDs(ctx context.Context, res *Result) error {
 	if err := json.Unmarshal(out, &ident); err != nil {
 		return fmt.Errorf("mkvmerge -J: bad json: %w", err)
 	}
+	return alignMkvIDs(res, ident)
+}
+
+func alignMkvIDs(res *Result, ident mkvIdentify) error {
 	typeMap := map[string]string{"video": "video", "audio": "audio", "subtitles": "subtitle"}
-	ids := map[string][]int{}
+	tracks := map[string][]mkvTrack{}
 	for _, t := range ident.Tracks {
 		ft, ok := typeMap[t.Type]
 		if !ok {
 			continue
 		}
-		ids[ft] = append(ids[ft], t.ID)
+		tracks[ft] = append(tracks[ft], mkvTrack{id: t.ID, lang: t.Properties.Language})
 	}
 	seen := map[string]int{}
 	for i, s := range res.Streams {
-		list := ids[s.Type]
+		list := tracks[s.Type]
 		pos := seen[s.Type]
 		if pos < len(list) {
-			res.Streams[i].MkvID = list[pos]
+			res.Streams[i].MkvID = list[pos].id
+			if !langsCompatible(s.Lang, list[pos].lang) {
+				return fmt.Errorf("track language mismatch for %s position %d: ffprobe=%q mkvmerge=%q",
+					s.Type, pos, s.Lang, list[pos].lang)
+			}
 		}
 		seen[s.Type]++
 	}
 	// Count mismatch means our alignment assumption is off for this file;
 	// report it so callers drop to the ffmpeg path.
 	for _, t := range []string{"video", "audio", "subtitle"} {
-		if len(ids[t]) != len(res.StreamsOfType(t)) {
+		if len(tracks[t]) != len(res.StreamsOfType(t)) {
 			return fmt.Errorf("track count mismatch for %s: mkvmerge=%d ffprobe=%d",
-				t, len(ids[t]), len(res.StreamsOfType(t)))
+				t, len(tracks[t]), len(res.StreamsOfType(t)))
 		}
 	}
 	return nil
+}
+
+func langsCompatible(a, b string) bool {
+	if a == "" || b == "" {
+		return true
+	}
+	return a == b
 }
 
 func exitDetail(err error) string {
