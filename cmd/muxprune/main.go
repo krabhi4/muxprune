@@ -44,6 +44,13 @@ func envInt(key string, def int) int {
 	return def
 }
 
+func envFloat(key string, def float64) float64 {
+	if f, err := strconv.ParseFloat(os.Getenv(key), 64); err == nil {
+		return f
+	}
+	return def
+}
+
 func envBool(key string, def bool) bool {
 	switch strings.ToLower(os.Getenv(key)) {
 	case "1", "true", "yes", "on":
@@ -126,7 +133,7 @@ func runServe(args []string) error {
 	}
 	defer st.Close()
 
-	prober := &probe.Prober{}
+	prober := &probe.Prober{Timeout: time.Duration(envInt("MUXPRUNE_PROBE_TIMEOUT", 60)) * time.Second}
 	if !prober.HasFFprobe() {
 		return fmt.Errorf("ffprobe not found in PATH; install ffmpeg")
 	}
@@ -135,7 +142,8 @@ func runServe(args []string) error {
 	if *recycleDays > 0 {
 		eng.RecycleDir = filepath.Join(*configDir, "recycle")
 	}
-	scanner := &scan.Scanner{Store: st, Prober: prober, Events: hub}
+	scanner := &scan.Scanner{Store: st, Prober: prober, Events: hub,
+		MaxPruneRatio: envFloat("MUXPRUNE_PRUNE_MAX_RATIO", 0.2)}
 	runner := &jobs.Runner{Store: st, Engine: eng, Scanner: scanner, Events: hub}
 	srv := &api.Server{Store: st, Scanner: scanner, Runner: runner, Engine: eng, Hub: hub, APIKey: *apiKey,
 		DefaultAutoScanInterval: envInt("MUXPRUNE_AUTOSCAN_DEFAULT", 21600)}
@@ -182,7 +190,7 @@ func runMCP(args []string) error {
 	}
 	defer st.Close()
 
-	prober := &probe.Prober{}
+	prober := &probe.Prober{Timeout: time.Duration(envInt("MUXPRUNE_PROBE_TIMEOUT", 60)) * time.Second}
 	if !prober.HasFFprobe() {
 		return fmt.Errorf("ffprobe not found in PATH; install ffmpeg")
 	}
@@ -191,7 +199,8 @@ func runMCP(args []string) error {
 	if *recycleDays > 0 {
 		eng.RecycleDir = filepath.Join(*configDir, "recycle")
 	}
-	scanner := &scan.Scanner{Store: st, Prober: prober, Events: hub}
+	scanner := &scan.Scanner{Store: st, Prober: prober, Events: hub,
+		MaxPruneRatio: envFloat("MUXPRUNE_PRUNE_MAX_RATIO", 0.2)}
 	runner := &jobs.Runner{Store: st, Engine: eng, Scanner: scanner, Events: hub}
 	srv := &api.Server{Store: st, Scanner: scanner, Runner: runner, Engine: eng, Hub: hub,
 		DefaultAutoScanInterval: envInt("MUXPRUNE_AUTOSCAN_DEFAULT", 21600)}
