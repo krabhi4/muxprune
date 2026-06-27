@@ -52,10 +52,31 @@ type Runner struct {
 
 	wake chan struct{}
 	once sync.Once
+
+	cmu       sync.Mutex
+	cancels   map[int64]context.CancelFunc
+	cancelled map[int64]bool
 }
 
 func (r *Runner) init() {
-	r.once.Do(func() { r.wake = make(chan struct{}, 1) })
+	r.once.Do(func() {
+		r.wake = make(chan struct{}, 1)
+		r.cancels = map[int64]context.CancelFunc{}
+		r.cancelled = map[int64]bool{}
+	})
+}
+
+func (r *Runner) Cancel(id int64) bool {
+	r.init()
+	r.cmu.Lock()
+	defer r.cmu.Unlock()
+	cancel, ok := r.cancels[id]
+	if !ok {
+		return false
+	}
+	r.cancelled[id] = true
+	cancel()
+	return true
 }
 
 // Wake nudges the workers; safe to call from any goroutine.
@@ -115,7 +136,20 @@ func (r *Runner) worker(ctx context.Context) {
 
 func (r *Runner) run(ctx context.Context, job *store.Job) {
 	r.notify(map[string]any{"id": job.ID, "status": "running", "type": job.Type, "file_path": job.FilePath})
-	status, log, saved := r.execute(ctx, job)
+	jobCtx, cancel := context.WithCancel(ctx)
+	r.cmu.Lock()
+	r.cancels[job.ID] = cancel
+	r.cmu.Unlock()
+	status, log, saved := r.execute(jobCtx, job)
+	r.cmu.Lock()
+	wasCancelled := r.cancelled[job.ID]
+	delete(r.cancels, job.ID)
+	delete(r.cancelled, job.ID)
+	r.cmu.Unlock()
+	cancel()
+	if wasCancelled {
+		status, log, saved = "cancelled", "cancelled by user", 0
+	}
 	if err := r.Store.FinishJob(job.ID, status, log, saved); err != nil {
 		fmt.Printf("jobs: finish %d: %v\n", job.ID, err)
 	}
@@ -152,7 +186,9 @@ func (r *Runner) execute(ctx context.Context, job *store.Job) (status, log strin
 			return "failed", err.Error(), 0
 		}
 		if p.SidecarID != 0 {
-			r.Store.DeleteSidecar(p.SidecarID)
+			if err := r.Store.DeleteSidecar(p.SidecarID); err != nil {
+				fmt.Printf("jobs: delete sidecar row %d: %v\n", p.SidecarID, err)
+			}
 		}
 		r.refreshFile(ctx, job.MediaFileID())
 		return "done", res.Command, res.BytesSaved
@@ -206,7 +242,9 @@ func (r *Runner) execute(ctx context.Context, job *store.Job) (status, log strin
 			return "failed", fmt.Sprintf("library %d not found", p.LibraryID), 0
 		}
 		serr := r.Scanner.ScanLibrary(ctx, lib)
-		r.Store.MarkLibraryScanned(lib.ID, time.Now().Unix())
+		if err := r.Store.MarkLibraryScanned(lib.ID, time.Now().Unix()); err != nil {
+			fmt.Printf("jobs: mark library %d scanned: %v\n", lib.ID, err)
+		}
 		if serr != nil {
 			return "failed", serr.Error(), 0
 		}
@@ -223,7 +261,9 @@ func (r *Runner) execute(ctx context.Context, job *store.Job) (status, log strin
 				return "failed", ctx.Err().Error(), 0
 			}
 			serr := r.Scanner.ScanLibrary(ctx, &libs[i])
-			r.Store.MarkLibraryScanned(libs[i].ID, time.Now().Unix())
+			if err := r.Store.MarkLibraryScanned(libs[i].ID, time.Now().Unix()); err != nil {
+				fmt.Printf("jobs: mark library %d scanned: %v\n", libs[i].ID, err)
+			}
 			if serr != nil {
 				failedLibs = append(failedLibs, fmt.Sprintf("%s: %v", libs[i].Name, serr))
 				continue

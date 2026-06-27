@@ -617,7 +617,7 @@ func (s *Store) FinishJob(id int64, status, log string, bytesSaved int64) error 
 }
 
 func (s *Store) CancelJob(id int64) error {
-	res, err := s.db.Exec(`UPDATE jobs SET status='failed', log='cancelled by user', finished_at=? WHERE id=? AND status='queued'`, time.Now().Unix(), id)
+	res, err := s.db.Exec(`UPDATE jobs SET status='cancelled', log='cancelled by user', finished_at=? WHERE id=? AND status='queued'`, time.Now().Unix(), id)
 	if err != nil {
 		return err
 	}
@@ -629,6 +629,22 @@ func (s *Store) CancelJob(id int64) error {
 		return fmt.Errorf("job %d is not queued and cannot be cancelled", id)
 	}
 	return nil
+}
+
+func (s *Store) RetryJob(id int64) (*Job, error) {
+	j, err := s.GetJob(id)
+	if err != nil {
+		return nil, err
+	}
+	if j == nil {
+		return nil, fmt.Errorf("job %d not found", id)
+	}
+	switch j.Status {
+	case "failed", "skipped", "cancelled":
+	default:
+		return nil, fmt.Errorf("job %d is %s and cannot be retried", id, j.Status)
+	}
+	return s.CreateJob(j.Type, j.MediaFileID(), j.FilePath, j.Payload)
 }
 
 func (s *Store) DeleteJob(id int64) error {

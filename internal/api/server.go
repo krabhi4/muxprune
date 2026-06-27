@@ -82,6 +82,7 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/v1/jobs", s.handleListJobs)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/cancel", s.handleCancelJob)
+	mux.HandleFunc("POST /api/v1/jobs/{id}/retry", s.handleRetryJob)
 	mux.HandleFunc("DELETE /api/v1/jobs/{id}", s.handleDeleteJob)
 	mux.HandleFunc("GET /api/v1/events", s.Hub.ServeSSE)
 	mux.HandleFunc("POST /api/v1/webhooks/arr", s.handleArrWebhook)
@@ -929,12 +930,31 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
+	if s.Runner.Cancel(id) {
+		writeJSON(w, 200, map[string]string{"status": "cancelling"})
+		return
+	}
 	if err := s.Store.CancelJob(id); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
-	s.Hub.Notify("job", map[string]any{"id": id, "status": "failed", "log": "cancelled by user"})
+	s.Hub.Notify("job", map[string]any{"id": id, "status": "cancelled", "log": "cancelled by user"})
 	writeJSON(w, 200, map[string]string{"status": "cancelled"})
+}
+
+func (s *Server) handleRetryJob(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	j, err := s.Store.RetryJob(id)
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	s.Runner.Wake()
+	writeJSON(w, 201, map[string]any{"job": j})
 }
 
 func (s *Server) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
