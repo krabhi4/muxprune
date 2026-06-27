@@ -38,17 +38,29 @@ func env(key, def string) string {
 }
 
 func envInt(key string, def int) int {
-	if n, err := strconv.Atoi(os.Getenv(key)); err == nil {
-		return n
+	v := os.Getenv(key)
+	if v == "" {
+		return def
 	}
-	return def
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "muxprune: invalid %s=%q, using default %d\n", key, v, def)
+		return def
+	}
+	return n
 }
 
 func envFloat(key string, def float64) float64 {
-	if f, err := strconv.ParseFloat(os.Getenv(key), 64); err == nil {
-		return f
+	v := os.Getenv(key)
+	if v == "" {
+		return def
 	}
-	return def
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "muxprune: invalid %s=%q, using default %g\n", key, v, def)
+		return def
+	}
+	return f
 }
 
 func envBool(key string, def bool) bool {

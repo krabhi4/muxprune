@@ -19,14 +19,17 @@ if [ "$(id -u)" = "0" ]; then
         adduser -D -H -u "$PUID" -G "$(getent group "$PGID" | cut -d: -f1)" muxprune
     fi
     if [ -n "$UMASK" ]; then
-        umask "$UMASK"
+        case "$UMASK" in
+            [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) umask "$UMASK" ;;
+            *) echo "muxprune: ignoring invalid UMASK=$UMASK (expected octal like 022)" >&2 ;;
+        esac
     fi
     mkdir -p "${MUXPRUNE_CONFIG:-/config}"
     chown "$PUID:$PGID" "${MUXPRUNE_CONFIG:-/config}"
 
     # If the subcommand is a known muxprune command, run it under su-exec
     case "$1" in
-        serve|inspect|strip|version)
+        serve|inspect|strip|mcp|version)
             exec su-exec "$PUID:$PGID" muxprune "$@"
             ;;
         *)
@@ -37,7 +40,7 @@ if [ "$(id -u)" = "0" ]; then
 fi
 
 case "$1" in
-    serve|inspect|strip|version)
+    serve|inspect|strip|mcp|version)
         exec muxprune "$@"
         ;;
     *)
