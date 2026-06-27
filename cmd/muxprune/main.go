@@ -61,7 +61,7 @@ func envBool(key string, def bool) bool {
 	return def
 }
 
-func startMonitor(ctx context.Context, st *store.Store, runner *jobs.Runner, hub *api.Hub) *watch.Monitor {
+func startMonitor(ctx context.Context, st *store.Store, runner *jobs.Runner, hub *api.Hub, wg *sync.WaitGroup) *watch.Monitor {
 	var enqMu sync.Mutex
 	enqueue := func(libID int64) {
 		enqMu.Lock()
@@ -81,7 +81,8 @@ func startMonitor(ctx context.Context, st *store.Store, runner *jobs.Runner, hub
 		WatchDisabled: !envBool("MUXPRUNE_WATCH", true),
 		Events:        hub,
 	})
-	go m.Start(ctx)
+	wg.Add(1)
+	go func() { defer wg.Done(); m.Start(ctx) }()
 	return m
 }
 
@@ -153,10 +154,13 @@ func runServe(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	go runner.Start(ctx, *workers)
-	srv.Monitor = startMonitor(ctx, st, runner, hub)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); runner.Start(ctx, *workers) }()
+	srv.Monitor = startMonitor(ctx, st, runner, hub, &wg)
 	if *recycleDays > 0 {
-		go purgeLoop(ctx, eng, time.Duration(*recycleDays)*24*time.Hour)
+		wg.Add(1)
+		go func() { defer wg.Done(); purgeLoop(ctx, eng, time.Duration(*recycleDays)*24*time.Hour) }()
 	}
 
 	bind := env("MUXPRUNE_BIND", "")
@@ -186,8 +190,11 @@ func runServe(args []string) error {
 
 	fmt.Printf("muxprune %s listening on %s (config: %s, mkvmerge: %v)\n",
 		version, httpSrv.Addr, *configDir, prober.HasMkvmerge())
-	if err := httpSrv.ListenAndServe(); err != http.ErrServerClosed {
-		return err
+	srvErr := httpSrv.ListenAndServe()
+	stop()
+	wg.Wait()
+	if srvErr != nil && srvErr != http.ErrServerClosed {
+		return srvErr
 	}
 	return nil
 }
@@ -243,13 +250,19 @@ func runMCP(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	go runner.Start(ctx, *workers)
-	srv.Monitor = startMonitor(ctx, st, runner, hub)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); runner.Start(ctx, *workers) }()
+	srv.Monitor = startMonitor(ctx, st, runner, hub, &wg)
 	if *recycleDays > 0 {
-		go purgeLoop(ctx, eng, time.Duration(*recycleDays)*24*time.Hour)
+		wg.Add(1)
+		go func() { defer wg.Done(); purgeLoop(ctx, eng, time.Duration(*recycleDays)*24*time.Hour) }()
 	}
 
-	return srv.ServeMCP(ctx)
+	err = srv.ServeMCP(ctx)
+	stop()
+	wg.Wait()
+	return err
 }
 
 func purgeLoop(ctx context.Context, eng *engine.Engine, maxAge time.Duration) {
