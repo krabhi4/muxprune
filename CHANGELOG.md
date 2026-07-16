@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Repeated authentication failures from an IP are rate limited (10 failures per minute locks the IP out temporarily).
 - Filesystem browsing is jailed: to `MUXPRUNE_BROWSE_ROOTS` when set, otherwise to the configured library roots; `..` traversal cannot escape. Library add/edit paths are validated against the explicit roots as well.
 - Sonarr/Radarr webhook supports a dedicated shared secret (`MUXPRUNE_WEBHOOK_SECRET`, header `X-Webhook-Secret`), enforced even when no API key is set.
-- Closed the mkvmerge/ffmpeg argument-injection class: `--` terminators before positional paths, `./` prefixing for option-like relative paths, rejection of external merge files whose names begin with `-` or `@`, and validation of metadata language tags plus control-character stripping in titles.
+- Closed the mkvmerge/ffmpeg argument-injection class: positional paths handed to mkvmerge/ffprobe are guarded with a `./` prefix whenever they could parse as options or option-files (mkvmerge itself has no `--` terminator support), external merge files whose names begin with `-` or `@` are rejected at validation time, and metadata language tags are validated with control characters stripped from titles.
 - HTTP server hardening: read/header/idle timeouts, 1 MB header cap, and a 10 MB request-body limit that returns `413`. A restrictive `Content-Security-Policy` header is set on all responses.
 - MCP: removed the wildcard `Access-Control-Allow-Origin` header from the SSE transport, and a disconnecting client can no longer crash the server via a send on a closed session channel.
 
