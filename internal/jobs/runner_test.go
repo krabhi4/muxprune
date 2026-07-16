@@ -58,3 +58,24 @@ func TestRunner_ScanLibraryJob_MarksLibraryScanned(t *testing.T) {
 		t.Error("LastScanFinishedAt = 0 after scan_library, want it stamped")
 	}
 }
+
+func TestFinalStatus(t *testing.T) {
+	cases := []struct {
+		name                 string
+		wasCancelled, killed bool
+		status, log          string
+		wantStatus, wantLog  string
+	}{
+		{"user cancel wins", true, true, "failed", "tool killed", "cancelled", "cancelled by user"},
+		{"shutdown kill relabels failure", false, true, "failed", "signal: killed", "cancelled", "cancelled by shutdown"},
+		{"natural failure kept", false, false, "failed", "bad file", "failed", "bad file"},
+		{"done kept even when killed late", false, true, "done", "ok", "done", "ok"},
+		{"skip kept", false, false, "skipped", "hardlink", "skipped", "hardlink"},
+	}
+	for _, c := range cases {
+		gs, gl := finalStatus(c.wasCancelled, c.killed, c.status, c.log)
+		if gs != c.wantStatus || gl != c.wantLog {
+			t.Errorf("%s: finalStatus=%q,%q want %q,%q", c.name, gs, gl, c.wantStatus, c.wantLog)
+		}
+	}
+}
