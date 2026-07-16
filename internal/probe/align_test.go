@@ -203,12 +203,12 @@ func TestSafePathArg(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := safePathArg(tt.in)
+			got := SafePathArg(tt.in)
 			if got != tt.want {
-				t.Errorf("safePathArg(%q) = %q, want %q", tt.in, got, tt.want)
+				t.Errorf("SafePathArg(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 			if got[0] == '-' || got[0] == '@' {
-				t.Errorf("safePathArg(%q) = %q still begins with an option-like prefix", tt.in, got)
+				t.Errorf("SafePathArg(%q) = %q still begins with an option-like prefix", tt.in, got)
 			}
 		})
 	}

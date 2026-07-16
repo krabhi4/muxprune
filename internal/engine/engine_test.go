@@ -264,14 +264,16 @@ func TestMkvmergeArgsTerminator(t *testing.T) {
 		},
 	}
 	args := mkvmergeArgs(res, RemovalSpec{AudioIdx: []int{2}})
-	if len(args) < 2 || args[len(args)-1] != res.Path || args[len(args)-2] != "--" {
-		t.Fatalf("expected args to end with %q then path, got %v", "--", args)
+	want := "./-tricky.mkv"
+	if len(args) < 1 || args[len(args)-1] != want {
+		t.Fatalf("expected args to end with guarded path %q, got %v", want, args)
+	}
+	if slices.Contains(args, res.Path) {
+		t.Fatalf("bare option-like path leaked into args: %v", args)
 	}
 	full := reorderOutput("mkvmerge", args, "out.mkv")
-	di := slices.Index(full, "--")
-	pi := slices.Index(full, res.Path)
-	if di < 0 || pi < 0 || di != pi-1 {
-		t.Fatalf("expected -- immediately before input path, got %v", full)
+	if !slices.Contains(full, want) || slices.Contains(full, res.Path) {
+		t.Fatalf("expected guarded path %q and no bare path in %v", want, full)
 	}
 }
 
