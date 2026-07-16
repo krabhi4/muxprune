@@ -217,13 +217,15 @@ func (r *Runner) execute(ctx context.Context, job *store.Job) (status, log strin
 		if err != nil {
 			return "failed", err.Error(), 0
 		}
+		warn := ""
 		if p.SidecarID != 0 {
 			if err := r.Store.DeleteSidecar(p.SidecarID); err != nil {
 				fmt.Printf("jobs: delete sidecar row %d: %v\n", p.SidecarID, err)
+				warn = " | warning: sidecar db row not removed: " + err.Error()
 			}
 		}
 		r.refreshFile(ctx, job.MediaFileID())
-		return "done", res.Command, res.BytesSaved
+		return "done", res.Command + warn, res.BytesSaved
 
 	case "edit_metadata":
 		var p EditMetadataPayload
@@ -274,20 +276,22 @@ func (r *Runner) execute(ctx context.Context, job *store.Job) (status, log strin
 			return "failed", fmt.Sprintf("library %d not found", p.LibraryID), 0
 		}
 		serr := r.Scanner.ScanLibrary(ctx, lib)
+		warn := ""
 		if err := r.Store.MarkLibraryScanned(lib.ID, time.Now().Unix()); err != nil {
 			fmt.Printf("jobs: mark library %d scanned: %v\n", lib.ID, err)
+			warn = " | warning: last-scanned stamp failed: " + err.Error()
 		}
 		if serr != nil {
-			return "failed", serr.Error(), 0
+			return "failed", serr.Error() + warn, 0
 		}
-		return "done", fmt.Sprintf("scanned library: %s", lib.Name), 0
+		return "done", fmt.Sprintf("scanned library: %s", lib.Name) + warn, 0
 
 	case "scan_all":
 		libs, err := r.Store.ListLibraries()
 		if err != nil {
 			return "failed", "db error: " + err.Error(), 0
 		}
-		var scanned, failedLibs []string
+		var scanned, failedLibs, stampWarns []string
 		for i := range libs {
 			if ctx.Err() != nil {
 				return "failed", ctx.Err().Error(), 0
@@ -295,6 +299,7 @@ func (r *Runner) execute(ctx context.Context, job *store.Job) (status, log strin
 			serr := r.Scanner.ScanLibrary(ctx, &libs[i])
 			if err := r.Store.MarkLibraryScanned(libs[i].ID, time.Now().Unix()); err != nil {
 				fmt.Printf("jobs: mark library %d scanned: %v\n", libs[i].ID, err)
+				stampWarns = append(stampWarns, libs[i].Name)
 			}
 			if serr != nil {
 				failedLibs = append(failedLibs, fmt.Sprintf("%s: %v", libs[i].Name, serr))
@@ -305,6 +310,9 @@ func (r *Runner) execute(ctx context.Context, job *store.Job) (status, log strin
 		log := "scanned: " + strings.Join(scanned, ", ")
 		if len(failedLibs) > 0 {
 			log += " | failed: " + strings.Join(failedLibs, "; ")
+		}
+		if len(stampWarns) > 0 {
+			log += " | warning: last-scanned stamp failed: " + strings.Join(stampWarns, ", ")
 		}
 		if len(scanned) == 0 && len(failedLibs) > 0 {
 			return "failed", log, 0
@@ -324,10 +332,16 @@ func (r *Runner) refreshFile(ctx context.Context, fileID int64) {
 	}
 	f, err := r.Store.GetFile(fileID)
 	if err != nil || f == nil {
+		if err != nil {
+			fmt.Printf("jobs: refresh file %d: %v\n", fileID, err)
+		}
 		return
 	}
 	lib, err := r.Store.GetLibrary(f.LibraryID)
 	if err != nil || lib == nil {
+		if err != nil {
+			fmt.Printf("jobs: refresh library %d: %v\n", f.LibraryID, err)
+		}
 		return
 	}
 	if err := r.Scanner.ScanFile(ctx, lib, f.Path); err != nil {
