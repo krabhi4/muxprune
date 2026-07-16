@@ -415,3 +415,51 @@ func TestStore_CancelJob(t *testing.T) {
 		t.Error("expected error when trying to cancel a running job")
 	}
 }
+
+func TestRetryJob_IncrementsAttempts(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	j, err := s.CreateJob("remux", 0, "/x/a.mkv", map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.Attempts != 0 {
+		t.Fatalf("new job attempts = %d, want 0", j.Attempts)
+	}
+	if _, err := s.ClaimNextJob(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishJob(j.ID, "failed", "boom", 0); err != nil {
+		t.Fatal(err)
+	}
+	r1, err := s.RetryJob(j.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r1.Attempts != 1 {
+		t.Errorf("first retry attempts = %d, want 1", r1.Attempts)
+	}
+	if _, err := s.ClaimNextJob(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishJob(r1.ID, "failed", "boom", 0); err != nil {
+		t.Fatal(err)
+	}
+	r2, err := s.RetryJob(r1.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r2.Attempts != 2 {
+		t.Errorf("second retry attempts = %d, want 2", r2.Attempts)
+	}
+	got, err := s.GetJob(r2.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Attempts != 2 {
+		t.Errorf("persisted attempts = %d, want 2", got.Attempts)
+	}
+}
