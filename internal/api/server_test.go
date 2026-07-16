@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"bytes"
 	"encoding/json"
 	"net/http"
@@ -251,4 +252,27 @@ func TestHandleUpdateLibrary_PreservesOmittedMonitoringFields(t *testing.T) {
 	if got.WatchEnabled != false {
 		t.Errorf("WatchEnabled = %v, want false (preserved)", got.WatchEnabled)
 	}
+}
+
+func TestMCPSSE_NoWildcardCORS(t *testing.T) {
+	s, h := newAuthServer(t)
+	_ = s
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", ts.URL+"/sse", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Api-Key", "secret")
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("Access-Control-Allow-Origin = %q, want unset", got)
+	}
+	cancel()
 }
