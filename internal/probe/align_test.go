@@ -90,6 +90,33 @@ func TestAlignMkvIDs(t *testing.T) {
 			]}`,
 			wantErr: true,
 		},
+		{
+			name: "codec mismatch on same-language reordered tracks errors",
+			streams: []Stream{
+				{Index: 0, Type: "video", Lang: "eng", Codec: "h264", MkvID: -1},
+				{Index: 1, Type: "audio", Lang: "eng", Codec: "aac", MkvID: -1},
+				{Index: 2, Type: "audio", Lang: "eng", Codec: "ac3", MkvID: -1},
+			},
+			mkvJSON: `{"tracks":[
+				{"id":0,"type":"video","properties":{"language":"eng","codec_id":"V_MPEG4/ISO/AVC"}},
+				{"id":1,"type":"audio","properties":{"language":"eng","codec_id":"A_AC3"}},
+				{"id":2,"type":"audio","properties":{"language":"eng","codec_id":"A_AAC"}}
+			]}`,
+			wantErr: true,
+		},
+		{
+			name: "matching codecs align",
+			streams: []Stream{
+				{Index: 0, Type: "video", Lang: "eng", Codec: "h264", MkvID: -1},
+				{Index: 1, Type: "audio", Lang: "eng", Codec: "aac", MkvID: -1},
+			},
+			mkvJSON: `{"tracks":[
+				{"id":0,"type":"video","properties":{"language":"eng","codec_id":"V_MPEG4/ISO/AVC"}},
+				{"id":1,"type":"audio","properties":{"language":"eng","codec_id":"A_AAC"}}
+			]}`,
+			wantErr:   false,
+			wantMkvID: []int{0, 1},
+		},
 	}
 
 	for _, tt := range tests {
@@ -127,6 +154,37 @@ func TestLangsCompatible(t *testing.T) {
 	for _, tt := range tests {
 		if got := langsCompatible(tt.a, tt.b); got != tt.want {
 			t.Errorf("langsCompatible(%q,%q) = %v, want %v", tt.a, tt.b, got, tt.want)
+		}
+	}
+}
+
+func TestCodecsCompatible(t *testing.T) {
+	cases := []struct {
+		mkv, ff string
+		want    bool
+	}{
+		{"V_MPEG4/ISO/AVC", "h264", true},
+		{"V_MPEGH/ISO/HEVC", "hevc", true},
+		{"A_AAC", "aac", true},
+		{"A_AC3", "ac3", true},
+		{"A_EAC3", "eac3", true},
+		{"A_DTS", "dts", true},
+		{"A_TRUEHD", "truehd", true},
+		{"A_OPUS", "opus", true},
+		{"A_FLAC", "flac", true},
+		{"S_TEXT/UTF8", "subrip", true},
+		{"S_TEXT/ASS", "ass", true},
+		{"S_HDMV/PGS", "hdmv_pgs_subtitle", true},
+		{"S_VOBSUB", "dvd_subtitle", true},
+		{"A_AAC", "ac3", false},
+		{"V_MPEG4/ISO/AVC", "hevc", false},
+		{"", "aac", true},
+		{"A_AAC", "", true},
+		{"X_UNKNOWN_CODEC", "somecodec", true},
+	}
+	for _, c := range cases {
+		if got := codecsCompatible(c.mkv, c.ff); got != c.want {
+			t.Errorf("codecsCompatible(%q,%q) = %v, want %v", c.mkv, c.ff, got, c.want)
 		}
 	}
 }
