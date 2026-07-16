@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-07-17
+
+### Security
+- Unified authentication wall over every protected route, including the MCP endpoints (`/sse`, `/api/v1/mcp/*`) that previously bypassed the API key check. Key comparison is constant-time, and the key is accepted via the `X-Api-Key` header only; the `?apikey=` query parameter is no longer read anywhere.
+- The Web UI now authenticates SSE and all requests through an httpOnly session cookie carrying a random 30-day token, issued by `POST /api/v1/auth/session` after a one-time header auth. The raw API key is no longer stored in the cookie or in `localStorage`.
+- When no API key is configured, the server binds to loopback only instead of exposing an unauthenticated control plane to the network (`MUXPRUNE_BIND` overrides for trusted networks).
+- Repeated authentication failures from an IP are rate limited (10 failures per minute locks the IP out temporarily).
+- Filesystem browsing is jailed: to `MUXPRUNE_BROWSE_ROOTS` when set, otherwise to the configured library roots; `..` traversal cannot escape. Library add/edit paths are validated against the explicit roots as well.
+- Sonarr/Radarr webhook supports a dedicated shared secret (`MUXPRUNE_WEBHOOK_SECRET`, header `X-Webhook-Secret`), enforced even when no API key is set.
+- Closed the mkvmerge/ffmpeg argument-injection class: `--` terminators before positional paths, `./` prefixing for option-like relative paths, rejection of external merge files whose names begin with `-` or `@`, and validation of metadata language tags plus control-character stripping in titles.
+- HTTP server hardening: read/header/idle timeouts, 1 MB header cap, and a 10 MB request-body limit that returns `413`. A restrictive `Content-Security-Policy` header is set on all responses.
+- MCP: removed the wildcard `Access-Control-Allow-Origin` header from the SSE transport, and a disconnecting client can no longer crash the server via a send on a closed session channel.
+
+### Fixed
+- The remux verification size floor can no longer go negative and silently disable itself when the estimated removed bytes exceed the input size; it is clamped to a hard minimum of 10% of the input, so a truncated output can never atomically replace good media.
+- A transient probe error (mid-import write, NFS hiccup, corrupt container) no longer prunes the still-present file's catalog record and sidecars; the record is kept alive and re-probed on a later pass.
+- A partially available mount can no longer mass-delete a library's catalog: pruning is refused when the walk hit unreadable subtrees, and when a single pass would delete more than `MUXPRUNE_PRUNE_MAX_RATIO` (default 20%) of the library's records.
+- Concurrent mutating jobs on the same file can no longer corrupt each other: each mutation holds a per-file lock and writes to a unique temp path (`MUXPRUNE_WORKERS` > 1 is now safe).
+- Each probe is bounded by a timeout (`MUXPRUNE_PROBE_TIMEOUT`, default 60s) so a stalled network mount cannot wedge a scan, and probe results with zero streams are rejected instead of being ingested as real, prunable files.
+- Recycled sidecars with the same basename deleted in the same second no longer overwrite each other, and cross-filesystem recycle moves are atomic (copy to a temp name, rename, delete source last).
+- mkvmerge track IDs are aligned to ffprobe streams with language and codec cross-checks; on any ambiguity the file falls back to the ffmpeg path instead of risking a wrong-track edit.
+- Graceful shutdown drains workers, the monitor, and the purge loop before closing the database, so a job that finishes during shutdown keeps its terminal status. A grace window (`MUXPRUNE_SHUTDOWN_GRACE`, default 30s) lets an almost-finished remux complete, and jobs killed by shutdown are recorded as `cancelled` rather than failed.
+- The filesystem watcher self-heals: transient errors re-add the full subtree and surface as `reconnecting`, dead watchers are rebuilt, a vanished mount downgrades to periodic scanning, and recursive watches are capped (default 8192) with an explicit degraded status instead of going silently blind. Fixed a data race on the watcher context.
+- Read-path correctness: `Stats` propagates query errors instead of returning zeros, `GetLibrary` no longer returns a half-populated struct alongside an error, and file search treats `%`/`_` literally.
+- Malformed or out-of-range numeric environment values produce a startup warning and fall back to defaults instead of being silently ignored; an invalid `UMASK` no longer crash-loops the container.
+
+### Added
+- Running jobs can be cancelled from the UI (per-job cancel with a distinct `cancelled` terminal status), and failed/skipped/cancelled jobs can be retried (`POST /api/v1/jobs/{id}/retry`); retries track an attempt count.
+- Job logs surface side-effect failures (sidecar record cleanup, last-scanned stamping) as warnings instead of swallowing them.
+- The effective configuration is logged at startup (workers, recycle retention, probe timeout, prune ratio, shutdown grace, watch, auth posture).
+- The `mcp` subcommand is available through the container entrypoint.
+
 ## [0.4.1] - 2026-06-21
 
 ### Fixed
