@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/krabhi4/muxprune/internal/engine"
 	"github.com/krabhi4/muxprune/internal/jobs"
@@ -47,6 +49,8 @@ type Server struct {
 
 	mcpMu       sync.Mutex
 	mcpSessions map[string]chan []byte
+
+	limiter authLimiter
 }
 
 const sessionCookie = "mp_session"
@@ -121,19 +125,94 @@ func (s *Server) authenticated(r *http.Request) bool {
 
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.APIKey != "" && protectedPath(r.URL.Path) && r.URL.Path != "/api/v1/health" {
-			if r.URL.Path == "/api/v1/webhooks/arr" && s.WebhookSecret != "" &&
-				constantTimeEqual(r.Header.Get("X-Webhook-Secret"), s.WebhookSecret) {
+		if !protectedPath(r.URL.Path) || r.URL.Path == "/api/v1/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if r.URL.Path == "/api/v1/webhooks/arr" && s.WebhookSecret != "" {
+			if constantTimeEqual(r.Header.Get("X-Webhook-Secret"), s.WebhookSecret) {
 				next.ServeHTTP(w, r)
 				return
 			}
-			if !s.authenticated(r) {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid api key"})
+			if s.APIKey == "" {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid webhook secret"})
 				return
 			}
 		}
+		if s.APIKey == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		ip := clientIP(r)
+		if s.limiter.blocked(ip) {
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many failed auth attempts; try again later"})
+			return
+		}
+		if !s.authenticated(r) {
+			s.limiter.fail(ip)
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid api key"})
+			return
+		}
+		s.limiter.reset(ip)
 		next.ServeHTTP(w, r)
 	})
+}
+
+type authLimiter struct {
+	mu    sync.Mutex
+	fails map[string]*failWindow
+}
+
+type failWindow struct {
+	count int
+	start time.Time
+}
+
+const (
+	authFailLimit  = 10
+	authFailWindow = time.Minute
+)
+
+func (l *authLimiter) blocked(ip string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	fw, ok := l.fails[ip]
+	if !ok {
+		return false
+	}
+	if time.Since(fw.start) > authFailWindow {
+		delete(l.fails, ip)
+		return false
+	}
+	return fw.count >= authFailLimit
+}
+
+func (l *authLimiter) fail(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.fails == nil {
+		l.fails = map[string]*failWindow{}
+	}
+	fw, ok := l.fails[ip]
+	if !ok || time.Since(fw.start) > authFailWindow {
+		l.fails[ip] = &failWindow{count: 1, start: time.Now()}
+		return
+	}
+	fw.count++
+}
+
+func (l *authLimiter) reset(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.fails, ip)
+}
+
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 func (s *Server) wrap(next http.Handler) http.Handler {
@@ -164,6 +243,10 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 }
 
 func writeErr(w http.ResponseWriter, code int, err error) {
+	var mbe *http.MaxBytesError
+	if errors.As(err, &mbe) {
+		code = http.StatusRequestEntityTooLarge
+	}
 	writeJSON(w, code, map[string]string{"error": err.Error()})
 }
 
