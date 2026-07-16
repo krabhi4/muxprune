@@ -272,7 +272,7 @@ func (s *Server) handleBrowse(w http.ResponseWriter, r *http.Request) {
 	}
 	path = filepath.Clean(path)
 
-	if len(s.BrowseRoots) > 0 && !s.pathAllowed(path) {
+	if roots := s.effectiveBrowseRoots(); len(roots) > 0 && !pathAllowed(path, roots) {
 		writeErr(w, 403, errors.New("path is outside the allowed roots"))
 		return
 	}
@@ -303,8 +303,23 @@ func (s *Server) handleBrowse(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) pathAllowed(path string) bool {
-	for _, root := range s.BrowseRoots {
+func (s *Server) effectiveBrowseRoots() []string {
+	if len(s.BrowseRoots) > 0 {
+		return s.BrowseRoots
+	}
+	libs, err := s.Store.ListLibraries()
+	if err != nil {
+		return nil
+	}
+	roots := make([]string, 0, len(libs))
+	for _, l := range libs {
+		roots = append(roots, l.Path)
+	}
+	return roots
+}
+
+func pathAllowed(path string, roots []string) bool {
+	for _, root := range roots {
 		root = filepath.Clean(root)
 		if path == root || strings.HasPrefix(path+string(filepath.Separator), root+string(filepath.Separator)) {
 			return true
@@ -392,6 +407,10 @@ func (s *Server) handleAddLibrary(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
+	if len(s.BrowseRoots) > 0 && !pathAllowed(req.Path, s.BrowseRoots) {
+		writeErr(w, 403, errors.New("library path is outside the allowed roots"))
+		return
+	}
 	interval := s.DefaultAutoScanInterval
 	if req.AutoScanInterval != nil {
 		interval = *req.AutoScanInterval
@@ -430,6 +449,10 @@ func (s *Server) handleUpdateLibrary(w http.ResponseWriter, r *http.Request) {
 	req, err := decodeLibraryReq(r)
 	if err != nil {
 		writeErr(w, 400, err)
+		return
+	}
+	if len(s.BrowseRoots) > 0 && !pathAllowed(req.Path, s.BrowseRoots) {
+		writeErr(w, 403, errors.New("library path is outside the allowed roots"))
 		return
 	}
 	l := &store.Library{
