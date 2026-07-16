@@ -41,6 +41,37 @@ func seedGhost(t *testing.T, sc *Scanner, lib *store.Library, n int) {
 	}
 }
 
+func TestScanLibrary_WalkErrorSkipsPrune(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("running as root; permission errors cannot be induced")
+	}
+	sc := newTestScanner(t)
+	sc.MaxPruneRatio = 1.0
+	dir := t.TempDir()
+	locked := filepath.Join(dir, "locked")
+	if err := os.MkdirAll(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(locked, 0o755) })
+	lib := &store.Library{Name: "L", Path: dir, Kind: "other", HardlinkPolicy: "skip"}
+	if err := sc.Store.AddLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	seedCacheHit(t, sc, lib, dir, "keep.mkv")
+	seedGhost(t, sc, lib, 9)
+	time.Sleep(1100 * time.Millisecond)
+
+	if err := sc.ScanLibrary(context.Background(), lib); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := sc.Store.CountFilesByLibrary(lib.ID); n != 10 {
+		t.Errorf("records after walk-error scan = %d, want 10 (prune skipped)", n)
+	}
+}
+
 func TestScanLibrary_RatioGuardSkipsMassPrune(t *testing.T) {
 	sc := newTestScanner(t)
 	dir := t.TempDir()

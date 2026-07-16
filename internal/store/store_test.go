@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -20,6 +21,77 @@ func TestEscapeLike(t *testing.T) {
 		if got := escapeLike(in); got != want {
 			t.Errorf("escapeLike(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestClaimNextJob_ExactlyOnceUnderConcurrency(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	const total = 60
+	for i := 0; i < total; i++ {
+		if _, err := s.CreateJob("remux", 0, fmt.Sprintf("/x/%d.mkv", i), map[string]any{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var mu sync.Mutex
+	claimed := map[int64]int{}
+	var wg sync.WaitGroup
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				j, err := s.ClaimNextJob()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if j == nil {
+					return
+				}
+				mu.Lock()
+				claimed[j.ID]++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if len(claimed) != total {
+		t.Errorf("claimed %d distinct jobs, want %d", len(claimed), total)
+	}
+	for id, n := range claimed {
+		if n != 1 {
+			t.Errorf("job %d claimed %d times", id, n)
+		}
+	}
+}
+
+func TestStats_PropagatesDBError(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if _, err := s.Stats(); err == nil {
+		t.Fatal("Stats on closed store must return an error, got nil")
+	}
+}
+
+func TestGetLibrary_PropagatesDBError(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	lib, err := s.GetLibrary(1)
+	if err == nil {
+		t.Fatal("GetLibrary on closed store must return an error, got nil")
+	}
+	if lib != nil {
+		t.Errorf("GetLibrary on error must return nil library, got %+v", lib)
 	}
 }
 

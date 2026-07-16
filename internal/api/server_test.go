@@ -123,8 +123,8 @@ func TestAuth_SessionCookie(t *testing.T) {
 	if !cookie.HttpOnly {
 		t.Fatalf("mp_session cookie is not HttpOnly")
 	}
-	if cookie.Value != "secret" {
-		t.Fatalf("cookie value = %q, want secret", cookie.Value)
+	if cookie.Value == "secret" {
+		t.Fatalf("session cookie must not contain the raw api key")
 	}
 
 	req = httptest.NewRequest("GET", "/api/v1/jobs", nil)
@@ -133,6 +133,14 @@ func TestAuth_SessionCookie(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
 		t.Fatalf("cookie-authed request: status = %d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest("GET", "/api/v1/jobs", nil)
+	req.AddCookie(&http.Cookie{Name: "mp_session", Value: "bogus"})
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("bogus cookie accepted: status = %d, want 401", rec.Code)
 	}
 }
 
@@ -311,6 +319,17 @@ func TestOversizedBodyRejected413(t *testing.T) {
 	h.ServeHTTP(w, req)
 	if w.Code != 413 {
 		t.Errorf("%d byte body = %d, want 413", len(body), w.Code)
+	}
+}
+
+func TestCSPHeaderPresent(t *testing.T) {
+	_, h := newTestServer(t)
+	req := httptest.NewRequest("GET", "/api/v1/stats", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	csp := w.Header().Get("Content-Security-Policy")
+	if !strings.Contains(csp, "default-src 'self'") {
+		t.Errorf("CSP header missing or weak: %q", csp)
 	}
 }
 
