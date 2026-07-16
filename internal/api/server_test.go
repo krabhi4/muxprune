@@ -1,13 +1,14 @@
 package api
 
 import (
-	"context"
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/krabhi4/muxprune/internal/engine"
@@ -275,4 +276,64 @@ func TestMCPSSE_NoWildcardCORS(t *testing.T) {
 		t.Errorf("Access-Control-Allow-Origin = %q, want unset", got)
 	}
 	cancel()
+}
+
+func TestAuth_WebhookSecretEnforcedWhenKeyless(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	s := &Server{Store: st, Hub: NewHub(), DefaultAutoScanInterval: 21600, WebhookSecret: "hook"}
+	h := s.Handler()
+
+	rec := doJSON(t, h, "POST", "/api/v1/webhooks/arr", `{}`)
+	if rec.Code != 401 {
+		t.Errorf("keyless webhook without secret = %d, want 401", rec.Code)
+	}
+	req := httptest.NewRequest("POST", "/api/v1/webhooks/arr", bytes.NewBufferString(`{}`))
+	req.Header.Set("X-Webhook-Secret", "hook")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code == 401 {
+		t.Errorf("keyless webhook with secret = %d, want non-401", w.Code)
+	}
+}
+
+func TestOversizedBodyRejected413(t *testing.T) {
+	_, h := newTestServer(t)
+	body := `{"file_ids":[` + strings.Repeat("1,", 6<<20) + `1]}`
+	req := httptest.NewRequest("POST", "/api/v1/batch", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != 413 {
+		t.Errorf("%d byte body = %d, want 413", len(body), w.Code)
+	}
+}
+
+func TestAuth_RateLimitsFailures(t *testing.T) {
+	_, h := newAuthServer(t)
+	for i := 0; i < 10; i++ {
+		req := httptest.NewRequest("GET", "/api/v1/stats", nil)
+		req.RemoteAddr = "10.9.8.7:1234"
+		req.Header.Set("X-Api-Key", "wrong")
+		h.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	req := httptest.NewRequest("GET", "/api/v1/stats", nil)
+	req.RemoteAddr = "10.9.8.7:1234"
+	req.Header.Set("X-Api-Key", "secret")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != 429 {
+		t.Errorf("locked-out ip with valid key = %d, want 429", w.Code)
+	}
+	req = httptest.NewRequest("GET", "/api/v1/stats", nil)
+	req.RemoteAddr = "10.1.1.1:9"
+	req.Header.Set("X-Api-Key", "secret")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code == 429 || w.Code == 401 {
+		t.Errorf("other ip with valid key = %d, want success", w.Code)
+	}
 }
