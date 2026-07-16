@@ -104,7 +104,7 @@ func (p *Prober) Probe(ctx context.Context, path string) (*Result, error) {
 	ctx, cancel := context.WithTimeout(ctx, p.timeout())
 	defer cancel()
 	out, err := exec.CommandContext(ctx, p.ffprobe,
-		"-v", "error", "-print_format", "json", "-show_format", "-show_streams", safePathArg(path)).Output()
+		"-v", "error", "-print_format", "json", "-show_format", "-show_streams", SafePathArg(path)).Output()
 	if err != nil {
 		return nil, fmt.Errorf("ffprobe %s: %w (%s)", path, err, exitDetail(err))
 	}
@@ -180,7 +180,7 @@ type mkvTrack struct {
 	codec string
 }
 
-func safePathArg(path string) string {
+func SafePathArg(path string) string {
 	if !strings.HasPrefix(path, "/") {
 		return "./" + path
 	}
@@ -191,7 +191,7 @@ func safePathArg(path string) string {
 // container order, but ffprobe additionally reports attachments/data streams,
 // so alignment is done per type position, not by raw index.
 func (p *Prober) attachMkvIDs(ctx context.Context, res *Result) error {
-	out, err := exec.CommandContext(ctx, p.mkvmerge, "-J", "--", safePathArg(res.Path)).Output()
+	out, err := exec.CommandContext(ctx, p.mkvmerge, "-J", SafePathArg(res.Path)).Output()
 	if err != nil {
 		return fmt.Errorf("mkvmerge -J: %w", err)
 	}

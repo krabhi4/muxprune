@@ -266,7 +266,7 @@ func (e *Engine) ReorderTracks(ctx context.Context, path string, spec ReorderSpe
 	tmp := tempPath(dir, base, ext)
 	defer os.Remove(tmp)
 
-	args := []string{"-q", "-o", tmp, "--track-order", trackOrder, "--", path}
+	args := []string{"-q", "-o", tmp, "--track-order", trackOrder, probe.SafePathArg(path)}
 	cmdline := e.mkvmerge + " " + strings.Join(args, " ")
 	tool, full := wrapNice(e.mkvmerge, args)
 	cmd := exec.CommandContext(ctx, tool, full...)
@@ -338,8 +338,10 @@ func (e *Engine) MergeTracks(ctx context.Context, path string, spec MergeSpec) (
 	tmp := tempPath(dir, base, ext)
 	defer os.Remove(tmp)
 
-	args := []string{"-q", "-o", tmp, "--", path}
-	args = append(args, spec.ExternalFiles...)
+	args := []string{"-q", "-o", tmp, probe.SafePathArg(path)}
+	for _, f := range spec.ExternalFiles {
+		args = append(args, probe.SafePathArg(f))
+	}
 	cmdline := e.mkvmerge + " " + strings.Join(args, " ")
 	tool, full := wrapNice(e.mkvmerge, args)
 	cmd := exec.CommandContext(ctx, tool, full...)
@@ -587,7 +589,7 @@ func mkvmergeArgs(res *probe.Result, spec RemovalSpec) []string {
 			args = append(args, "--subtitle-tracks", strings.Join(ids, ","))
 		}
 	}
-	return append(args, "--", res.Path)
+	return append(args, probe.SafePathArg(res.Path))
 }
 
 func ffmpegArgs(res *probe.Result, spec RemovalSpec) []string {
