@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -335,5 +337,62 @@ func TestAuth_RateLimitsFailures(t *testing.T) {
 	h.ServeHTTP(w, req)
 	if w.Code == 429 || w.Code == 401 {
 		t.Errorf("other ip with valid key = %d, want success", w.Code)
+	}
+}
+
+func TestHandleBrowse_DefaultsToLibraryRoots(t *testing.T) {
+	s, h := newTestServer(t)
+	dir := t.TempDir()
+	if err := s.Store.AddLibrary(&store.Library{Name: "L", Path: dir, Kind: "other", HardlinkPolicy: "skip"}); err != nil {
+		t.Fatal(err)
+	}
+	rec := doJSON(t, h, "GET", "/api/v1/browse?path="+dir, "")
+	if rec.Code != 200 {
+		t.Errorf("inside library root = %d, want 200", rec.Code)
+	}
+	rec = doJSON(t, h, "GET", "/api/v1/browse?path=/etc", "")
+	if rec.Code != 403 {
+		t.Errorf("outside library root = %d, want 403", rec.Code)
+	}
+}
+
+func TestHandleBrowse_TraversalCannotEscape(t *testing.T) {
+	root := t.TempDir()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	s := &Server{Store: st, Hub: NewHub(), BrowseRoots: []string{root}}
+	h := s.Handler()
+	rec := doJSON(t, h, "GET", "/api/v1/browse?path="+url.QueryEscape(root+"/../../../etc"), "")
+	if rec.Code != 403 {
+		t.Errorf("traversal escape = %d, want 403", rec.Code)
+	}
+}
+
+func TestHandleAddLibrary_JailedToBrowseRoots(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	s := &Server{Store: st, Hub: NewHub(), DefaultAutoScanInterval: 21600, BrowseRoots: []string{root}}
+	h := s.Handler()
+	rec := doJSON(t, h, "POST", "/api/v1/libraries", `{"path":"`+outside+`"}`)
+	if rec.Code != 403 {
+		t.Errorf("library outside roots = %d, want 403", rec.Code)
+	}
+	inside := filepath.Join(root, "media")
+	if err := os.MkdirAll(inside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rec = doJSON(t, h, "POST", "/api/v1/libraries", `{"path":"`+inside+`"}`)
+	if rec.Code != 201 {
+		t.Errorf("library inside roots = %d body=%s, want 201", rec.Code, rec.Body.String())
 	}
 }
