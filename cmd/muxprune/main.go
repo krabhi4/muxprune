@@ -50,6 +50,15 @@ func envInt(key string, def int) int {
 	return n
 }
 
+func envIntIn(key string, def, min, max int) int {
+	n := envInt(key, def)
+	if n < min || n > max {
+		fmt.Fprintf(os.Stderr, "muxprune: %s=%d out of range [%d,%d], using default %d\n", key, n, min, max, def)
+		return def
+	}
+	return n
+}
+
 func envFloat(key string, def float64) float64 {
 	v := os.Getenv(key)
 	if v == "" {
@@ -129,10 +138,10 @@ var version = "dev"
 
 func runServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	port := fs.Int("port", envInt("MUXPRUNE_PORT", 8484), "listen port")
+	port := fs.Int("port", envIntIn("MUXPRUNE_PORT", 8484, 1, 65535), "listen port")
 	configDir := fs.String("config", env("MUXPRUNE_CONFIG", "./data"), "config/state directory")
-	workers := fs.Int("workers", envInt("MUXPRUNE_WORKERS", 1), "concurrent job workers")
-	recycleDays := fs.Int("recycle-days", envInt("MUXPRUNE_RECYCLE_DAYS", 7),
+	workers := fs.Int("workers", envIntIn("MUXPRUNE_WORKERS", 1, 1, 64), "concurrent job workers")
+	recycleDays := fs.Int("recycle-days", envIntIn("MUXPRUNE_RECYCLE_DAYS", 7, 0, 3650),
 		"keep deleted sidecars this many days (0 = delete permanently)")
 	apiKey := fs.String("api-key", env("MUXPRUNE_API_KEY", ""), "require this key on /api/* (empty = open)")
 	fs.Parse(args)
@@ -146,7 +155,14 @@ func runServe(args []string) error {
 	}
 	defer st.Close()
 
-	prober := &probe.Prober{Timeout: time.Duration(envInt("MUXPRUNE_PROBE_TIMEOUT", 60)) * time.Second}
+	probeTimeout := envIntIn("MUXPRUNE_PROBE_TIMEOUT", 60, 1, 3600)
+	pruneRatio := envFloat("MUXPRUNE_PRUNE_MAX_RATIO", 0.2)
+	grace := envIntIn("MUXPRUNE_SHUTDOWN_GRACE", 30, 0, 3600)
+	watchEnabled := envBool("MUXPRUNE_WATCH", true)
+	webhookSecret := env("MUXPRUNE_WEBHOOK_SECRET", "")
+	roots := browseRoots()
+
+	prober := &probe.Prober{Timeout: time.Duration(probeTimeout) * time.Second}
 	if !prober.HasFFprobe() {
 		return fmt.Errorf("ffprobe not found in PATH; install ffmpeg")
 	}
@@ -156,13 +172,13 @@ func runServe(args []string) error {
 		eng.RecycleDir = filepath.Join(*configDir, "recycle")
 	}
 	scanner := &scan.Scanner{Store: st, Prober: prober, Events: hub,
-		MaxPruneRatio: envFloat("MUXPRUNE_PRUNE_MAX_RATIO", 0.2)}
+		MaxPruneRatio: pruneRatio}
 	runner := &jobs.Runner{Store: st, Engine: eng, Scanner: scanner, Events: hub,
-		ShutdownGrace: time.Duration(envInt("MUXPRUNE_SHUTDOWN_GRACE", 30)) * time.Second}
+		ShutdownGrace: time.Duration(grace) * time.Second}
 	srv := &api.Server{Store: st, Scanner: scanner, Runner: runner, Engine: eng, Hub: hub, APIKey: *apiKey,
-		WebhookSecret:           env("MUXPRUNE_WEBHOOK_SECRET", ""),
-		BrowseRoots:             browseRoots(),
-		DefaultAutoScanInterval: envInt("MUXPRUNE_AUTOSCAN_DEFAULT", 21600)}
+		WebhookSecret:           webhookSecret,
+		BrowseRoots:             roots,
+		DefaultAutoScanInterval: envIntIn("MUXPRUNE_AUTOSCAN_DEFAULT", 21600, 0, 31536000)}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -203,6 +219,9 @@ func runServe(args []string) error {
 
 	fmt.Printf("muxprune %s listening on %s (config: %s, mkvmerge: %v)\n",
 		version, httpSrv.Addr, *configDir, prober.HasMkvmerge())
+	fmt.Printf("muxprune config: workers=%d recycle_days=%d probe_timeout=%ds prune_max_ratio=%.2f shutdown_grace=%ds watch=%v api_key=%v webhook_secret=%v browse_roots=%d\n",
+		*workers, *recycleDays, probeTimeout, pruneRatio, grace, watchEnabled,
+		*apiKey != "", webhookSecret != "", len(roots))
 	srvErr := httpSrv.ListenAndServe()
 	stop()
 	wg.Wait()
@@ -229,8 +248,8 @@ func browseRoots() []string {
 func runMCP(args []string) error {
 	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
 	configDir := fs.String("config", env("MUXPRUNE_CONFIG", "./data"), "config/state directory")
-	workers := fs.Int("workers", envInt("MUXPRUNE_WORKERS", 1), "concurrent job workers")
-	recycleDays := fs.Int("recycle-days", envInt("MUXPRUNE_RECYCLE_DAYS", 7),
+	workers := fs.Int("workers", envIntIn("MUXPRUNE_WORKERS", 1, 1, 64), "concurrent job workers")
+	recycleDays := fs.Int("recycle-days", envIntIn("MUXPRUNE_RECYCLE_DAYS", 7, 0, 3650),
 		"keep deleted sidecars this many days (0 = delete permanently)")
 	fs.Parse(args)
 
@@ -243,7 +262,7 @@ func runMCP(args []string) error {
 	}
 	defer st.Close()
 
-	prober := &probe.Prober{Timeout: time.Duration(envInt("MUXPRUNE_PROBE_TIMEOUT", 60)) * time.Second}
+	prober := &probe.Prober{Timeout: time.Duration(envIntIn("MUXPRUNE_PROBE_TIMEOUT", 60, 1, 3600)) * time.Second}
 	if !prober.HasFFprobe() {
 		return fmt.Errorf("ffprobe not found in PATH; install ffmpeg")
 	}
@@ -255,11 +274,11 @@ func runMCP(args []string) error {
 	scanner := &scan.Scanner{Store: st, Prober: prober, Events: hub,
 		MaxPruneRatio: envFloat("MUXPRUNE_PRUNE_MAX_RATIO", 0.2)}
 	runner := &jobs.Runner{Store: st, Engine: eng, Scanner: scanner, Events: hub,
-		ShutdownGrace: time.Duration(envInt("MUXPRUNE_SHUTDOWN_GRACE", 30)) * time.Second}
+		ShutdownGrace: time.Duration(envIntIn("MUXPRUNE_SHUTDOWN_GRACE", 30, 0, 3600)) * time.Second}
 	srv := &api.Server{Store: st, Scanner: scanner, Runner: runner, Engine: eng, Hub: hub,
 		WebhookSecret:           env("MUXPRUNE_WEBHOOK_SECRET", ""),
 		BrowseRoots:             browseRoots(),
-		DefaultAutoScanInterval: envInt("MUXPRUNE_AUTOSCAN_DEFAULT", 21600)}
+		DefaultAutoScanInterval: envIntIn("MUXPRUNE_AUTOSCAN_DEFAULT", 21600, 0, 31536000)}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
