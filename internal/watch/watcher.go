@@ -174,7 +174,7 @@ func (w *libWatcher) loop(ctx context.Context) {
 				return
 			}
 			if err != nil {
-				w.status("error: " + err.Error())
+				w.status("reconnecting")
 				if addErr := w.fsw.Add(w.root); addErr != nil {
 					w.died("re-add root failed: " + addErr.Error())
 					return
@@ -184,6 +184,9 @@ func (w *libWatcher) loop(ctx context.Context) {
 				w.degraded = false
 				w.mu.Unlock()
 				w.addRecursive(w.root)
+				if !w.isDegraded() {
+					w.status("watching")
+				}
 			}
 		}
 	}
