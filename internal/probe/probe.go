@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Stream struct {
@@ -50,9 +51,18 @@ func (r *Result) StreamsOfType(t string) []Stream {
 
 // Prober shells out to ffprobe/mkvmerge. Binary paths are resolved once.
 type Prober struct {
+	Timeout time.Duration
+
 	once     sync.Once
 	ffprobe  string
 	mkvmerge string
+}
+
+func (p *Prober) timeout() time.Duration {
+	if p.Timeout > 0 {
+		return p.Timeout
+	}
+	return 60 * time.Second
 }
 
 func (p *Prober) resolve() {
@@ -91,13 +101,31 @@ func (p *Prober) Probe(ctx context.Context, path string) (*Result, error) {
 	if p.ffprobe == "" {
 		return nil, fmt.Errorf("ffprobe not found in PATH")
 	}
+	ctx, cancel := context.WithTimeout(ctx, p.timeout())
+	defer cancel()
 	out, err := exec.CommandContext(ctx, p.ffprobe,
-		"-v", "error", "-print_format", "json", "-show_format", "-show_streams", path).Output()
+		"-v", "error", "-print_format", "json", "-show_format", "-show_streams", SafePathArg(path)).Output()
 	if err != nil {
 		return nil, fmt.Errorf("ffprobe %s: %w (%s)", path, err, exitDetail(err))
 	}
+	res, err := ParseFFprobe(out, path)
+	if err != nil {
+		return nil, err
+	}
+	if res.IsMatroska() && p.mkvmerge != "" {
+		if err := p.attachMkvIDs(ctx, res); err != nil {
+			// Non-fatal: engine falls back to ffmpeg for this file.
+			for i := range res.Streams {
+				res.Streams[i].MkvID = -1
+			}
+		}
+	}
+	return res, nil
+}
+
+func ParseFFprobe(data []byte, path string) (*Result, error) {
 	var raw ffprobeOut
-	if err := json.Unmarshal(out, &raw); err != nil {
+	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("ffprobe %s: bad json: %w", path, err)
 	}
 	res := &Result{Path: path, Format: raw.Format.FormatName}
@@ -129,29 +157,41 @@ func (p *Prober) Probe(ctx context.Context, path string) (*Result, error) {
 		}
 		res.Streams = append(res.Streams, st)
 	}
-	if res.IsMatroska() && p.mkvmerge != "" {
-		if err := p.attachMkvIDs(ctx, res); err != nil {
-			// Non-fatal: engine falls back to ffmpeg for this file.
-			for i := range res.Streams {
-				res.Streams[i].MkvID = -1
-			}
-		}
+	if len(res.Streams) == 0 {
+		return nil, fmt.Errorf("ffprobe %s: no streams found (corrupt or unsupported container)", path)
 	}
 	return res, nil
 }
 
 type mkvIdentify struct {
 	Tracks []struct {
-		ID   int    `json:"id"`
-		Type string `json:"type"` // video, audio, subtitles
+		ID         int    `json:"id"`
+		Type       string `json:"type"` // video, audio, subtitles
+		Properties struct {
+			Language string `json:"language"`
+			CodecID  string `json:"codec_id"`
+		} `json:"properties"`
 	} `json:"tracks"`
+}
+
+type mkvTrack struct {
+	id    int
+	lang  string
+	codec string
+}
+
+func SafePathArg(path string) string {
+	if !strings.HasPrefix(path, "/") {
+		return "./" + path
+	}
+	return path
 }
 
 // attachMkvIDs aligns mkvmerge tracks to ffprobe streams. Both list tracks in
 // container order, but ffprobe additionally reports attachments/data streams,
 // so alignment is done per type position, not by raw index.
 func (p *Prober) attachMkvIDs(ctx context.Context, res *Result) error {
-	out, err := exec.CommandContext(ctx, p.mkvmerge, "-J", res.Path).Output()
+	out, err := exec.CommandContext(ctx, p.mkvmerge, "-J", SafePathArg(res.Path)).Output()
 	if err != nil {
 		return fmt.Errorf("mkvmerge -J: %w", err)
 	}
@@ -159,33 +199,87 @@ func (p *Prober) attachMkvIDs(ctx context.Context, res *Result) error {
 	if err := json.Unmarshal(out, &ident); err != nil {
 		return fmt.Errorf("mkvmerge -J: bad json: %w", err)
 	}
+	return alignMkvIDs(res, ident)
+}
+
+func alignMkvIDs(res *Result, ident mkvIdentify) error {
 	typeMap := map[string]string{"video": "video", "audio": "audio", "subtitles": "subtitle"}
-	ids := map[string][]int{}
+	tracks := map[string][]mkvTrack{}
 	for _, t := range ident.Tracks {
 		ft, ok := typeMap[t.Type]
 		if !ok {
 			continue
 		}
-		ids[ft] = append(ids[ft], t.ID)
+		tracks[ft] = append(tracks[ft], mkvTrack{id: t.ID, lang: t.Properties.Language, codec: t.Properties.CodecID})
 	}
 	seen := map[string]int{}
 	for i, s := range res.Streams {
-		list := ids[s.Type]
+		list := tracks[s.Type]
 		pos := seen[s.Type]
 		if pos < len(list) {
-			res.Streams[i].MkvID = list[pos]
+			res.Streams[i].MkvID = list[pos].id
+			if !langsCompatible(s.Lang, list[pos].lang) {
+				return fmt.Errorf("track language mismatch for %s position %d: ffprobe=%q mkvmerge=%q",
+					s.Type, pos, s.Lang, list[pos].lang)
+			}
+			if !codecsCompatible(list[pos].codec, s.Codec) {
+				return fmt.Errorf("track codec mismatch for %s position %d: ffprobe=%q mkvmerge=%q",
+					s.Type, pos, s.Codec, list[pos].codec)
+			}
 		}
 		seen[s.Type]++
 	}
 	// Count mismatch means our alignment assumption is off for this file;
 	// report it so callers drop to the ffmpeg path.
 	for _, t := range []string{"video", "audio", "subtitle"} {
-		if len(ids[t]) != len(res.StreamsOfType(t)) {
+		if len(tracks[t]) != len(res.StreamsOfType(t)) {
 			return fmt.Errorf("track count mismatch for %s: mkvmerge=%d ffprobe=%d",
-				t, len(ids[t]), len(res.StreamsOfType(t)))
+				t, len(tracks[t]), len(res.StreamsOfType(t)))
 		}
 	}
 	return nil
+}
+
+func langsCompatible(a, b string) bool {
+	if a == "" || b == "" {
+		return true
+	}
+	return a == b
+}
+
+var mkvCodecNames = map[string]string{
+	"V_MPEG4/ISO/AVC":  "h264",
+	"V_MPEGH/ISO/HEVC": "hevc",
+	"V_AV1":            "av1",
+	"V_VP9":            "vp9",
+	"V_VP8":            "vp8",
+	"V_MPEG2":          "mpeg2video",
+	"A_AAC":            "aac",
+	"A_AC3":            "ac3",
+	"A_EAC3":           "eac3",
+	"A_DTS":            "dts",
+	"A_TRUEHD":         "truehd",
+	"A_FLAC":           "flac",
+	"A_OPUS":           "opus",
+	"A_VORBIS":         "vorbis",
+	"A_MPEG/L3":        "mp3",
+	"S_TEXT/UTF8":      "subrip",
+	"S_TEXT/ASS":       "ass",
+	"S_TEXT/SSA":       "ssa",
+	"S_TEXT/WEBVTT":    "webvtt",
+	"S_HDMV/PGS":       "hdmv_pgs_subtitle",
+	"S_VOBSUB":         "dvd_subtitle",
+}
+
+func codecsCompatible(mkvCodecID, ffCodec string) bool {
+	if mkvCodecID == "" || ffCodec == "" {
+		return true
+	}
+	want, known := mkvCodecNames[mkvCodecID]
+	if !known {
+		return true
+	}
+	return strings.EqualFold(want, ffCodec)
 }
 
 func exitDetail(err error) string {

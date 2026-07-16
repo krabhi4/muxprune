@@ -14,11 +14,20 @@ function human(b) {
   return n.toFixed(n >= 100 || i === 0 ? 0 : 1) + " " + units[i];
 }
 
-let apiKey = localStorage.getItem("muxprune_api_key") || "";
+let apiKey = "";
+localStorage.removeItem("muxprune_api_key");
+
+async function ensureSession() {
+  if (!apiKey) return;
+  await fetch("/api/v1/auth/session", {
+    method: "POST",
+    headers: { "X-Api-Key": apiKey },
+  }).catch(() => {});
+  apiKey = "";
+}
 
 async function api(path, opts = {}) {
   const headers = { ...(opts.headers || {}) };
-  if (apiKey) headers["X-Api-Key"] = apiKey;
   if (opts.body && typeof opts.body !== "string") {
     opts.body = JSON.stringify(opts.body);
     headers["Content-Type"] = "application/json";
@@ -28,7 +37,7 @@ async function api(path, opts = {}) {
     const key = prompt("API key required:");
     if (key) {
       apiKey = key;
-      localStorage.setItem("muxprune_api_key", key);
+      await ensureSession();
       return api(path, opts);
     }
   }
@@ -962,8 +971,9 @@ async function loadJobs() {
       <td class="num">${j.bytes_saved ? human(j.bytes_saved) : ""}</td>
       <td class="sub">${esc(j.log)}</td>
       <td class="num">
-        ${j.status === "queued" ? `<button data-act="cancel">Cancel</button>` : ""}
-        ${j.status === "done" || j.status === "failed" || j.status === "skipped" ? `<button data-act="del" class="danger">Delete</button>` : ""}
+        ${j.status === "queued" || j.status === "running" ? `<button data-act="cancel">Cancel</button>` : ""}
+        ${j.status === "failed" || j.status === "skipped" || j.status === "cancelled" ? `<button data-act="retry">Retry</button>` : ""}
+        ${j.status === "done" || j.status === "failed" || j.status === "skipped" || j.status === "cancelled" ? `<button data-act="del" class="danger">Delete</button>` : ""}
       </td>
     </tr>`).join("");
   $("#jobs-empty").hidden = data.jobs.length > 0;
@@ -988,6 +998,14 @@ $("#jobs-table").addEventListener("click", async (e) => {
     try {
       await api(`/jobs/${id}/cancel`, { method: "POST" });
       toast(`Job #${id} cancelled`);
+      loadJobs();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  } else if (btn.dataset.act === "retry") {
+    try {
+      await api(`/jobs/${id}/retry`, { method: "POST" });
+      toast(`Job #${id} re-queued`);
       loadJobs();
     } catch (err) {
       toast(err.message, true);
@@ -1028,8 +1046,7 @@ $("#btn-jobs-next").addEventListener("click", () => {
 
 // ---- live events ----
 function connectEvents() {
-  const url = "/api/v1/events" + (apiKey ? "?apikey=" + encodeURIComponent(apiKey) : "");
-  const es = new EventSource(url);
+  const es = new EventSource("/api/v1/events");
   es.addEventListener("scan", (e) => {
     const d = JSON.parse(e.data);
     const box = $("#scan-progress");
@@ -1063,8 +1080,10 @@ function connectEvents() {
 // ---- boot ----
 parseURL();
 syncInputsToState();
-loadLibraries().then(() => {
-  refresh();
-}).catch((e) => toast(e.message, true));
-loadStats();
-connectEvents();
+ensureSession().then(() => {
+  loadLibraries().then(() => {
+    refresh();
+  }).catch((e) => toast(e.message, true));
+  loadStats();
+  connectEvents();
+});

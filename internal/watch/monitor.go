@@ -203,7 +203,11 @@ func (m *Monitor) Reconcile() {
 		m.mu.Lock()
 		m.watchers[lib.ID] = w
 		m.mu.Unlock()
-		m.setStatus(lib.ID, "watching")
+		if w.isDegraded() {
+			m.setStatus(lib.ID, "watch-limit")
+		} else {
+			m.setStatus(lib.ID, "watching")
+		}
 	}
 }
 

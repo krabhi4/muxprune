@@ -742,7 +742,6 @@ func (s *Server) handleMCPSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	// Create and register session channel
 	ch := make(chan []byte, 100)
@@ -757,7 +756,6 @@ func (s *Server) handleMCPSSE(w http.ResponseWriter, r *http.Request) {
 		s.mcpMu.Lock()
 		delete(s.mcpSessions, sessionID)
 		s.mcpMu.Unlock()
-		close(ch)
 	}()
 
 	// Send initial endpoint event. This tells the client where to send POST messages.
@@ -811,7 +809,7 @@ func (s *Server) handleMCPMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	go func() {
-		s.handleMCPSSERequest(r.Context(), ch, &req)
+		s.handleMCPSSERequest(context.WithoutCancel(r.Context()), ch, &req)
 	}()
 
 	w.WriteHeader(http.StatusOK)

@@ -6,6 +6,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -49,6 +52,229 @@ func langs(res *probe.Result, typ string) []string {
 		out = append(out, s.Lang)
 	}
 	return out
+}
+
+func TestSizeFloor(t *testing.T) {
+	cases := []struct {
+		name               string
+		inSize, estRemoved int64
+		want               int64
+	}{
+		{"no estimate", 1000, 0, 700},
+		{"partial estimate", 1000, 200, 560},
+		{"estimate exceeds input", 1000, 2000, 100},
+		{"estimate equals input", 1000, 1000, 100},
+	}
+	for _, c := range cases {
+		if got := sizeFloor(c.inSize, c.estRemoved); got != c.want {
+			t.Errorf("%s: sizeFloor(%d,%d)=%d, want %d", c.name, c.inSize, c.estRemoved, got, c.want)
+		}
+	}
+	if got := sizeFloor(1000, 1<<40); got < 0 {
+		t.Errorf("floor went negative: %d", got)
+	}
+}
+
+func TestVerifyRejectsCorruptOutput(t *testing.T) {
+	if _, err := exec.LookPath("ffprobe"); err != nil {
+		t.Skip("ffprobe not installed")
+	}
+	dir := t.TempDir()
+	tmp := filepath.Join(dir, "bad.mkv")
+	if err := os.WriteFile(tmp, []byte("this is not a media file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	in := &probe.Result{
+		Path: "orig.mkv", Format: "matroska,webm", Duration: 3, Size: 100000,
+		Streams: []probe.Stream{
+			{Index: 0, Type: "video"},
+			{Index: 1, Type: "audio"},
+			{Index: 2, Type: "audio"},
+		},
+	}
+	e := &Engine{Prober: &probe.Prober{}}
+	if err := e.verify(context.Background(), in, RemovalSpec{AudioIdx: []int{2}}, tmp); err == nil {
+		t.Fatal("verify must reject a corrupt output, but returned nil")
+	}
+}
+
+func TestTempPathUniqueAndSkippable(t *testing.T) {
+	a := tempPath("/d", "movie", ".mkv")
+	b := tempPath("/d", "movie", ".mkv")
+	if a == b {
+		t.Fatalf("temp paths must be unique, both = %s", a)
+	}
+	if !strings.Contains(a, ".muxprune.tmp") {
+		t.Errorf("temp path missing scanner-skip marker: %s", a)
+	}
+}
+
+func TestKeyedMutexSerializesSameKey(t *testing.T) {
+	var km keyedMutex
+	var mu sync.Mutex
+	var active, maxActive int
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			unlock := km.lock("same/file.mkv")
+			defer unlock()
+			mu.Lock()
+			active++
+			if active > maxActive {
+				maxActive = active
+			}
+			mu.Unlock()
+			time.Sleep(time.Millisecond)
+			mu.Lock()
+			active--
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	if maxActive != 1 {
+		t.Fatalf("keyedMutex allowed %d concurrent holders for the same key, want 1", maxActive)
+	}
+}
+
+func TestKeyedMutexAllowsDifferentKeys(t *testing.T) {
+	var km keyedMutex
+	unlockA := km.lock("a")
+	defer unlockA()
+	done := make(chan struct{})
+	go func() {
+		unlockB := km.lock("b")
+		unlockB()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("lock on a different key blocked")
+	}
+}
+
+func TestUniqueDst(t *testing.T) {
+	dir := t.TempDir()
+	name := "20260628-120000_2_eng.srt"
+	a := uniqueDst(dir, name)
+	if a != filepath.Join(dir, name) {
+		t.Fatalf("first call should return the plain name, got %s", a)
+	}
+	if err := os.WriteFile(a, []byte("first"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	b := uniqueDst(dir, name)
+	if b == a {
+		t.Fatal("uniqueDst returned a path that already exists (would overwrite)")
+	}
+	if _, err := os.Stat(b); err == nil {
+		t.Fatalf("second path %s should not exist yet", b)
+	}
+}
+
+func TestValidLanguageTag(t *testing.T) {
+	tests := []struct {
+		tag  string
+		want bool
+	}{
+		{"eng", true},
+		{"en", true},
+		{"pt-BR", true},
+		{"zh-Hant-HK", true},
+		{"", false},
+		{"en_US", false},
+		{"en US", false},
+		{"123", false},
+		{"en-", false},
+		{"-en", false},
+		{"en--US", false},
+		{"e\nn", false},
+		{"en;rm -rf", false},
+	}
+	for _, tc := range tests {
+		if got := validLanguageTag(tc.tag); got != tc.want {
+			t.Errorf("validLanguageTag(%q) = %v, want %v", tc.tag, got, tc.want)
+		}
+	}
+}
+
+func TestStripControl(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"Director's Cut", "Director's Cut"},
+		{"bad\x00title", "badtitle"},
+		{"line\nbreak", "linebreak"},
+		{"tab\there", "tabhere"},
+		{"del\x7fchar", "delchar"},
+		{"\x01\x02\x03", ""},
+	}
+	for _, tc := range tests {
+		if got := stripControl(tc.in); got != tc.want {
+			t.Errorf("stripControl(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestValidateExternalFilesRejectsHostile(t *testing.T) {
+	dir := t.TempDir()
+	mkv := filepath.Join(dir, "movie.mkv")
+	os.WriteFile(mkv, []byte("x"), 0o644)
+
+	dash := filepath.Join(dir, "-evil.srt")
+	at := filepath.Join(dir, "@evil.srt")
+	ok := filepath.Join(dir, "good.srt")
+	os.WriteFile(dash, []byte("x"), 0o644)
+	os.WriteFile(at, []byte("x"), 0o644)
+	os.WriteFile(ok, []byte("x"), 0o644)
+
+	tests := []struct {
+		name    string
+		files   []string
+		wantErr bool
+	}{
+		{"dash prefix", []string{dash}, true},
+		{"at prefix", []string{at}, true},
+		{"normal", []string{ok}, false},
+		{"mixed rejects", []string{ok, dash}, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateExternalFiles(mkv, tc.files)
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected error for %v, got nil", tc.files)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error for %v: %v", tc.files, err)
+			}
+		})
+	}
+}
+
+func TestMkvmergeArgsTerminator(t *testing.T) {
+	res := &probe.Result{
+		Path: "-tricky.mkv",
+		Streams: []probe.Stream{
+			{Index: 0, Type: "video", MkvID: 0},
+			{Index: 1, Type: "audio", MkvID: 1},
+			{Index: 2, Type: "audio", MkvID: 2},
+		},
+	}
+	args := mkvmergeArgs(res, RemovalSpec{AudioIdx: []int{2}})
+	want := "./-tricky.mkv"
+	if len(args) < 1 || args[len(args)-1] != want {
+		t.Fatalf("expected args to end with guarded path %q, got %v", want, args)
+	}
+	if slices.Contains(args, res.Path) {
+		t.Fatalf("bare option-like path leaked into args: %v", args)
+	}
+	full := reorderOutput("mkvmerge", args, "out.mkv")
+	if !slices.Contains(full, want) || slices.Contains(full, res.Path) {
+		t.Fatalf("expected guarded path %q and no bare path in %v", want, full)
+	}
 }
 
 func TestRemoveTracks(t *testing.T) {

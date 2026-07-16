@@ -105,6 +105,9 @@ CREATE TABLE IF NOT EXISTS settings (
 			return err
 		}
 	}
+	if err := s.addColumn("jobs", "attempts INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -170,7 +173,10 @@ func (s *Store) GetLibrary(id int64) (*Library, error) {
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
-	return l, err
+	if err != nil {
+		return nil, err
+	}
+	return l, nil
 }
 
 func (s *Store) ListLibraries() ([]Library, error) {
@@ -320,6 +326,13 @@ func (s *Store) PruneFiles(libraryID int64, scanStart int64) (int64, error) {
 	return res.RowsAffected()
 }
 
+func (s *Store) CountStaleFiles(libraryID, scanStart int64) (int64, error) {
+	var n int64
+	err := s.db.QueryRow(`SELECT count(*) FROM media_files WHERE library_id=? AND scanned_at<?`,
+		libraryID, scanStart).Scan(&n)
+	return n, err
+}
+
 func (s *Store) ReplaceSidecars(fileID int64, scs []Sidecar) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -378,8 +391,8 @@ func (s *Store) ListFiles(f FileFilter) ([]MediaFile, int, error) {
 		args = append(args, f.Kind)
 	}
 	if f.Query != "" {
-		where = append(where, "(path LIKE ? OR series LIKE ? OR title LIKE ?)")
-		q := "%" + f.Query + "%"
+		where = append(where, `(path LIKE ? ESCAPE '\' OR series LIKE ? ESCAPE '\' OR title LIKE ? ESCAPE '\')`)
+		q := "%" + escapeLike(f.Query) + "%"
 		args = append(args, q, q, q)
 	}
 	if f.Hardlinks == "yes" {
@@ -502,6 +515,7 @@ type Job struct {
 	FilePath   string          `json:"file_path"`
 	Payload    json.RawMessage `json:"payload"`
 	Status     string          `json:"status"` // queued, running, done, failed, skipped
+	Attempts   int             `json:"attempts"`
 	Log        string          `json:"log"`
 	BytesSaved int64           `json:"bytes_saved"`
 	CreatedAt  int64           `json:"created_at"`
@@ -587,8 +601,8 @@ func (s *Store) ClaimNextJob() (*Job, error) {
 	var payload string
 	err := s.db.QueryRow(`UPDATE jobs SET status='running'
 		WHERE id=(SELECT id FROM jobs WHERE status='queued' ORDER BY id LIMIT 1)
-		RETURNING id,type,media_file_id,file_path,payload_json,created_at`).
-		Scan(&j.ID, &j.Type, &j.FileID, &j.FilePath, &payload, &j.CreatedAt)
+		RETURNING id,type,media_file_id,file_path,payload_json,attempts,created_at`).
+		Scan(&j.ID, &j.Type, &j.FileID, &j.FilePath, &payload, &j.Attempts, &j.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -607,7 +621,7 @@ func (s *Store) FinishJob(id int64, status, log string, bytesSaved int64) error 
 }
 
 func (s *Store) CancelJob(id int64) error {
-	res, err := s.db.Exec(`UPDATE jobs SET status='failed', log='cancelled by user', finished_at=? WHERE id=? AND status='queued'`, time.Now().Unix(), id)
+	res, err := s.db.Exec(`UPDATE jobs SET status='cancelled', log='cancelled by user', finished_at=? WHERE id=? AND status='queued'`, time.Now().Unix(), id)
 	if err != nil {
 		return err
 	}
@@ -619,6 +633,30 @@ func (s *Store) CancelJob(id int64) error {
 		return fmt.Errorf("job %d is not queued and cannot be cancelled", id)
 	}
 	return nil
+}
+
+func (s *Store) RetryJob(id int64) (*Job, error) {
+	j, err := s.GetJob(id)
+	if err != nil {
+		return nil, err
+	}
+	if j == nil {
+		return nil, fmt.Errorf("job %d not found", id)
+	}
+	switch j.Status {
+	case "failed", "skipped", "cancelled":
+	default:
+		return nil, fmt.Errorf("job %d is %s and cannot be retried", id, j.Status)
+	}
+	nj, err := s.CreateJob(j.Type, j.MediaFileID(), j.FilePath, j.Payload)
+	if err != nil {
+		return nil, err
+	}
+	nj.Attempts = j.Attempts + 1
+	if _, err := s.db.Exec(`UPDATE jobs SET attempts=? WHERE id=?`, nj.Attempts, nj.ID); err != nil {
+		return nil, err
+	}
+	return nj, nil
 }
 
 func (s *Store) DeleteJob(id int64) error {
@@ -666,7 +704,7 @@ func (s *Store) ListJobs(status string, limit, offset int) ([]Job, int, error) {
 		return nil, 0, err
 	}
 
-	q := `SELECT id,type,media_file_id,file_path,payload_json,status,log,bytes_saved,created_at,finished_at
+	q := `SELECT id,type,media_file_id,file_path,payload_json,status,attempts,log,bytes_saved,created_at,finished_at
 		FROM jobs`
 	var args []any
 	if status != "" {
@@ -684,7 +722,7 @@ func (s *Store) ListJobs(status string, limit, offset int) ([]Job, int, error) {
 	for rows.Next() {
 		var j Job
 		var payload string
-		if err := rows.Scan(&j.ID, &j.Type, &j.FileID, &j.FilePath, &payload, &j.Status, &j.Log,
+		if err := rows.Scan(&j.ID, &j.Type, &j.FileID, &j.FilePath, &payload, &j.Status, &j.Attempts, &j.Log,
 			&j.BytesSaved, &j.CreatedAt, &j.FinishedAt); err != nil {
 			return nil, 0, err
 		}
@@ -697,9 +735,9 @@ func (s *Store) ListJobs(status string, limit, offset int) ([]Job, int, error) {
 func (s *Store) GetJob(id int64) (*Job, error) {
 	j := &Job{}
 	var payload string
-	err := s.db.QueryRow(`SELECT id,type,media_file_id,file_path,payload_json,status,log,bytes_saved,created_at,finished_at
+	err := s.db.QueryRow(`SELECT id,type,media_file_id,file_path,payload_json,status,attempts,log,bytes_saved,created_at,finished_at
 		FROM jobs WHERE id=?`, id).
-		Scan(&j.ID, &j.Type, &j.FileID, &j.FilePath, &payload, &j.Status, &j.Log,
+		Scan(&j.ID, &j.Type, &j.FileID, &j.FilePath, &payload, &j.Status, &j.Attempts, &j.Log,
 			&j.BytesSaved, &j.CreatedAt, &j.FinishedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -714,13 +752,23 @@ func (s *Store) GetJob(id int64) (*Job, error) {
 func (s *Store) Stats() (map[string]int64, error) {
 	out := map[string]int64{}
 	var saved, files, queued int64
-	s.db.QueryRow(`SELECT coalesce(sum(bytes_saved),0) FROM jobs WHERE status='done'`).Scan(&saved)
-	s.db.QueryRow(`SELECT count(*) FROM media_files`).Scan(&files)
-	s.db.QueryRow(`SELECT count(*) FROM jobs WHERE status IN ('queued','running')`).Scan(&queued)
+	if err := s.db.QueryRow(`SELECT coalesce(sum(bytes_saved),0) FROM jobs WHERE status='done'`).Scan(&saved); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM media_files`).Scan(&files); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM jobs WHERE status IN ('queued','running')`).Scan(&queued); err != nil {
+		return nil, err
+	}
 	out["bytes_saved"] = saved
 	out["files"] = files
 	out["active_jobs"] = queued
 	return out, nil
+}
+
+func escapeLike(s string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
 }
 
 // ---- settings ----

@@ -2,6 +2,7 @@ package scan
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,6 +11,131 @@ import (
 	"github.com/krabhi4/muxprune/internal/probe"
 	"github.com/krabhi4/muxprune/internal/store"
 )
+
+func seedCacheHit(t *testing.T, sc *Scanner, lib *store.Library, dir, name string) {
+	t.Helper()
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, []byte("realfilecontents"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &store.MediaFile{
+		LibraryID: lib.ID, Path: p, Size: info.Size(), Mtime: info.ModTime().Unix(),
+		Nlink: 1, SidecarSummary: "", ProbeJSON: "{}",
+	}
+	if err := sc.Store.UpsertMediaFile(rec); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedGhost(t *testing.T, sc *Scanner, lib *store.Library, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		g := &store.MediaFile{LibraryID: lib.ID, Path: fmt.Sprintf("/gone/ghost%d.mkv", i), Size: 1, Mtime: 1, Nlink: 1}
+		if err := sc.Store.UpsertMediaFile(g); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestScanLibrary_WalkErrorSkipsPrune(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("running as root; permission errors cannot be induced")
+	}
+	sc := newTestScanner(t)
+	sc.MaxPruneRatio = 1.0
+	dir := t.TempDir()
+	locked := filepath.Join(dir, "locked")
+	if err := os.MkdirAll(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(locked, 0o755) })
+	lib := &store.Library{Name: "L", Path: dir, Kind: "other", HardlinkPolicy: "skip"}
+	if err := sc.Store.AddLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	seedCacheHit(t, sc, lib, dir, "keep.mkv")
+	seedGhost(t, sc, lib, 9)
+	time.Sleep(1100 * time.Millisecond)
+
+	if err := sc.ScanLibrary(context.Background(), lib); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := sc.Store.CountFilesByLibrary(lib.ID); n != 10 {
+		t.Errorf("records after walk-error scan = %d, want 10 (prune skipped)", n)
+	}
+}
+
+func TestScanLibrary_RatioGuardSkipsMassPrune(t *testing.T) {
+	sc := newTestScanner(t)
+	dir := t.TempDir()
+	lib := &store.Library{Name: "L", Path: dir, Kind: "other", HardlinkPolicy: "skip"}
+	if err := sc.Store.AddLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	seedCacheHit(t, sc, lib, dir, "keep.mkv")
+	seedGhost(t, sc, lib, 9)
+	time.Sleep(1100 * time.Millisecond)
+
+	if err := sc.ScanLibrary(context.Background(), lib); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := sc.Store.CountFilesByLibrary(lib.ID); n != 10 {
+		t.Errorf("records after guarded scan = %d, want 10 (prune skipped)", n)
+	}
+}
+
+func TestScanLibrary_PrunesWhenUnderThreshold(t *testing.T) {
+	sc := newTestScanner(t)
+	sc.MaxPruneRatio = 1.0
+	dir := t.TempDir()
+	lib := &store.Library{Name: "L", Path: dir, Kind: "other", HardlinkPolicy: "skip"}
+	if err := sc.Store.AddLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	seedCacheHit(t, sc, lib, dir, "keep.mkv")
+	seedGhost(t, sc, lib, 9)
+	time.Sleep(1100 * time.Millisecond)
+
+	if err := sc.ScanLibrary(context.Background(), lib); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := sc.Store.CountFilesByLibrary(lib.ID); n != 1 {
+		t.Errorf("records after permissive scan = %d, want 1 (ghosts pruned)", n)
+	}
+}
+
+func TestScanLibrary_ProbeErrorKeepsExistingRecord(t *testing.T) {
+	sc := newTestScanner(t)
+	sc.MaxPruneRatio = 1.0
+	dir := t.TempDir()
+	lib := &store.Library{Name: "L", Path: dir, Kind: "other", HardlinkPolicy: "skip"}
+	if err := sc.Store.AddLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	bad := filepath.Join(dir, "bad.mkv")
+	if err := os.WriteFile(bad, []byte("not media"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec := &store.MediaFile{LibraryID: lib.ID, Path: bad, Size: 1, Mtime: 1, Nlink: 1, ProbeJSON: ""}
+	if err := sc.Store.UpsertMediaFile(rec); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+
+	if err := sc.ScanLibrary(context.Background(), lib); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := sc.Store.CountFilesByLibrary(lib.ID); n != 1 {
+		t.Errorf("records after probe-error scan = %d, want 1 (record preserved)", n)
+	}
+}
 
 func newTestScanner(t *testing.T) *Scanner {
 	t.Helper()
