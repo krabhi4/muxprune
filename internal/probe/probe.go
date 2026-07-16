@@ -175,8 +175,9 @@ type mkvIdentify struct {
 }
 
 type mkvTrack struct {
-	id   int
-	lang string
+	id    int
+	lang  string
+	codec string
 }
 
 func safePathArg(path string) string {
@@ -209,7 +210,7 @@ func alignMkvIDs(res *Result, ident mkvIdentify) error {
 		if !ok {
 			continue
 		}
-		tracks[ft] = append(tracks[ft], mkvTrack{id: t.ID, lang: t.Properties.Language})
+		tracks[ft] = append(tracks[ft], mkvTrack{id: t.ID, lang: t.Properties.Language, codec: t.Properties.CodecID})
 	}
 	seen := map[string]int{}
 	for i, s := range res.Streams {
@@ -220,6 +221,10 @@ func alignMkvIDs(res *Result, ident mkvIdentify) error {
 			if !langsCompatible(s.Lang, list[pos].lang) {
 				return fmt.Errorf("track language mismatch for %s position %d: ffprobe=%q mkvmerge=%q",
 					s.Type, pos, s.Lang, list[pos].lang)
+			}
+			if !codecsCompatible(list[pos].codec, s.Codec) {
+				return fmt.Errorf("track codec mismatch for %s position %d: ffprobe=%q mkvmerge=%q",
+					s.Type, pos, s.Codec, list[pos].codec)
 			}
 		}
 		seen[s.Type]++
@@ -240,6 +245,41 @@ func langsCompatible(a, b string) bool {
 		return true
 	}
 	return a == b
+}
+
+var mkvCodecNames = map[string]string{
+	"V_MPEG4/ISO/AVC":  "h264",
+	"V_MPEGH/ISO/HEVC": "hevc",
+	"V_AV1":            "av1",
+	"V_VP9":            "vp9",
+	"V_VP8":            "vp8",
+	"V_MPEG2":          "mpeg2video",
+	"A_AAC":            "aac",
+	"A_AC3":            "ac3",
+	"A_EAC3":           "eac3",
+	"A_DTS":            "dts",
+	"A_TRUEHD":         "truehd",
+	"A_FLAC":           "flac",
+	"A_OPUS":           "opus",
+	"A_VORBIS":         "vorbis",
+	"A_MPEG/L3":        "mp3",
+	"S_TEXT/UTF8":      "subrip",
+	"S_TEXT/ASS":       "ass",
+	"S_TEXT/SSA":       "ssa",
+	"S_TEXT/WEBVTT":    "webvtt",
+	"S_HDMV/PGS":       "hdmv_pgs_subtitle",
+	"S_VOBSUB":         "dvd_subtitle",
+}
+
+func codecsCompatible(mkvCodecID, ffCodec string) bool {
+	if mkvCodecID == "" || ffCodec == "" {
+		return true
+	}
+	want, known := mkvCodecNames[mkvCodecID]
+	if !known {
+		return true
+	}
+	return strings.EqualFold(want, ffCodec)
 }
 
 func exitDetail(err error) string {
