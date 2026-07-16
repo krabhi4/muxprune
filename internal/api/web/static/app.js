@@ -14,7 +14,8 @@ function human(b) {
   return n.toFixed(n >= 100 || i === 0 ? 0 : 1) + " " + units[i];
 }
 
-let apiKey = localStorage.getItem("muxprune_api_key") || "";
+let apiKey = "";
+localStorage.removeItem("muxprune_api_key");
 
 async function ensureSession() {
   if (!apiKey) return;
@@ -22,11 +23,11 @@ async function ensureSession() {
     method: "POST",
     headers: { "X-Api-Key": apiKey },
   }).catch(() => {});
+  apiKey = "";
 }
 
 async function api(path, opts = {}) {
   const headers = { ...(opts.headers || {}) };
-  if (apiKey) headers["X-Api-Key"] = apiKey;
   if (opts.body && typeof opts.body !== "string") {
     opts.body = JSON.stringify(opts.body);
     headers["Content-Type"] = "application/json";
@@ -36,7 +37,6 @@ async function api(path, opts = {}) {
     const key = prompt("API key required:");
     if (key) {
       apiKey = key;
-      localStorage.setItem("muxprune_api_key", key);
       await ensureSession();
       return api(path, opts);
     }

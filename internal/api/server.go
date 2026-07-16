@@ -2,8 +2,10 @@
 package api
 
 import (
+	"crypto/rand"
 	"crypto/subtle"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,6 +53,9 @@ type Server struct {
 	mcpSessions map[string]chan []byte
 
 	limiter authLimiter
+
+	sessMu   sync.Mutex
+	sessions map[string]time.Time
 }
 
 const sessionCookie = "mp_session"
@@ -118,9 +123,38 @@ func (s *Server) authenticated(r *http.Request) bool {
 		return constantTimeEqual(key, s.APIKey)
 	}
 	if c, err := r.Cookie(sessionCookie); err == nil {
-		return constantTimeEqual(c.Value, s.APIKey)
+		return s.sessionValid(c.Value)
 	}
 	return false
+}
+
+const sessionTTL = 30 * 24 * time.Hour
+
+func (s *Server) newSession() string {
+	b := make([]byte, 32)
+	rand.Read(b)
+	tok := hex.EncodeToString(b)
+	s.sessMu.Lock()
+	if s.sessions == nil {
+		s.sessions = map[string]time.Time{}
+	}
+	s.sessions[tok] = time.Now().Add(sessionTTL)
+	s.sessMu.Unlock()
+	return tok
+}
+
+func (s *Server) sessionValid(tok string) bool {
+	s.sessMu.Lock()
+	defer s.sessMu.Unlock()
+	exp, ok := s.sessions[tok]
+	if !ok {
+		return false
+	}
+	if time.Now().After(exp) {
+		delete(s.sessions, tok)
+		return false
+	}
+	return true
 }
 
 func (s *Server) auth(next http.Handler) http.Handler {
@@ -227,11 +261,11 @@ func (s *Server) wrap(next http.Handler) http.Handler {
 func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookie,
-		Value:    s.APIKey,
+		Value:    s.newSession(),
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
-		MaxAge:   2592000,
+		MaxAge:   int(sessionTTL / time.Second),
 	})
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
