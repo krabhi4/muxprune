@@ -157,7 +157,8 @@ func runServe(args []string) error {
 	}
 	scanner := &scan.Scanner{Store: st, Prober: prober, Events: hub,
 		MaxPruneRatio: envFloat("MUXPRUNE_PRUNE_MAX_RATIO", 0.2)}
-	runner := &jobs.Runner{Store: st, Engine: eng, Scanner: scanner, Events: hub}
+	runner := &jobs.Runner{Store: st, Engine: eng, Scanner: scanner, Events: hub,
+		ShutdownGrace: time.Duration(envInt("MUXPRUNE_SHUTDOWN_GRACE", 30)) * time.Second}
 	srv := &api.Server{Store: st, Scanner: scanner, Runner: runner, Engine: eng, Hub: hub, APIKey: *apiKey,
 		WebhookSecret:           env("MUXPRUNE_WEBHOOK_SECRET", ""),
 		BrowseRoots:             browseRoots(),
@@ -253,7 +254,8 @@ func runMCP(args []string) error {
 	}
 	scanner := &scan.Scanner{Store: st, Prober: prober, Events: hub,
 		MaxPruneRatio: envFloat("MUXPRUNE_PRUNE_MAX_RATIO", 0.2)}
-	runner := &jobs.Runner{Store: st, Engine: eng, Scanner: scanner, Events: hub}
+	runner := &jobs.Runner{Store: st, Engine: eng, Scanner: scanner, Events: hub,
+		ShutdownGrace: time.Duration(envInt("MUXPRUNE_SHUTDOWN_GRACE", 30)) * time.Second}
 	srv := &api.Server{Store: st, Scanner: scanner, Runner: runner, Engine: eng, Hub: hub,
 		WebhookSecret:           env("MUXPRUNE_WEBHOOK_SECRET", ""),
 		BrowseRoots:             browseRoots(),

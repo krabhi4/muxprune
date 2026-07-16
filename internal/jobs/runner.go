@@ -45,10 +45,11 @@ type ScanLibraryPayload struct {
 }
 
 type Runner struct {
-	Store   *store.Store
-	Engine  *engine.Engine
-	Scanner *scan.Scanner
-	Events  scan.Notifier
+	Store         *store.Store
+	Engine        *engine.Engine
+	Scanner       *scan.Scanner
+	Events        scan.Notifier
+	ShutdownGrace time.Duration
 
 	wake chan struct{}
 	once sync.Once
@@ -56,6 +57,23 @@ type Runner struct {
 	cmu       sync.Mutex
 	cancels   map[int64]context.CancelFunc
 	cancelled map[int64]bool
+}
+
+func (r *Runner) grace() time.Duration {
+	if r.ShutdownGrace > 0 {
+		return r.ShutdownGrace
+	}
+	return 30 * time.Second
+}
+
+func finalStatus(wasCancelled, killed bool, status, log string) (string, string) {
+	if wasCancelled {
+		return "cancelled", "cancelled by user"
+	}
+	if killed && status == "failed" {
+		return "cancelled", "cancelled by shutdown"
+	}
+	return status, log
 }
 
 func (r *Runner) init() {
@@ -119,6 +137,9 @@ func (r *Runner) worker(ctx context.Context) {
 	defer ticker.Stop()
 	for {
 		for {
+			if ctx.Err() != nil {
+				return
+			}
 			job, err := r.Store.ClaimNextJob()
 			if err != nil || job == nil {
 				break
@@ -136,19 +157,30 @@ func (r *Runner) worker(ctx context.Context) {
 
 func (r *Runner) run(ctx context.Context, job *store.Job) {
 	r.notify(map[string]any{"id": job.ID, "status": "running", "type": job.Type, "file_path": job.FilePath})
-	jobCtx, cancel := context.WithCancel(ctx)
+	jobCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	stopWatch := context.AfterFunc(ctx, func() {
+		t := time.NewTimer(r.grace())
+		defer t.Stop()
+		select {
+		case <-t.C:
+			cancel()
+		case <-jobCtx.Done():
+		}
+	})
 	r.cmu.Lock()
 	r.cancels[job.ID] = cancel
 	r.cmu.Unlock()
 	status, log, saved := r.execute(jobCtx, job)
+	killed := jobCtx.Err() != nil
+	stopWatch()
 	r.cmu.Lock()
 	wasCancelled := r.cancelled[job.ID]
 	delete(r.cancels, job.ID)
 	delete(r.cancelled, job.ID)
 	r.cmu.Unlock()
 	cancel()
-	if wasCancelled {
-		status, log, saved = "cancelled", "cancelled by user", 0
+	if status, log = finalStatus(wasCancelled, killed, status, log); status == "cancelled" {
+		saved = 0
 	}
 	if err := r.Store.FinishJob(job.ID, status, log, saved); err != nil {
 		fmt.Printf("jobs: finish %d: %v\n", job.ID, err)
