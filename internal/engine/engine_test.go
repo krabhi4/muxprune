@@ -243,7 +243,7 @@ func TestValidateExternalFilesRejectsHostile(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateExternalFiles(mkv, tc.files)
+			err := (&Engine{}).ValidateExternalFiles(mkv, tc.files)
 			if tc.wantErr && err == nil {
 				t.Fatalf("expected error for %v, got nil", tc.files)
 			}
@@ -544,5 +544,57 @@ func TestMergeTracks(t *testing.T) {
 	subLangs := langs(after, "subtitle")
 	if len(subLangs) != 3 {
 		t.Errorf("expected 3 subtitle tracks after merge, got %d: %v", len(subLangs), subLangs)
+	}
+}
+
+func TestValidateExternalFiles_RootContainment(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	mkv := filepath.Join(root, "show.mkv")
+	if err := os.WriteFile(mkv, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	inside := filepath.Join(root, "show.eng.srt")
+	if err := os.WriteFile(inside, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stray := filepath.Join(outside, "stray.srt")
+	if err := os.WriteFile(stray, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	unrestricted := &Engine{}
+	if err := unrestricted.ValidateExternalFiles(mkv, []string{stray}); err != nil {
+		t.Errorf("no AllowedRoots provider should not restrict: %v", err)
+	}
+
+	e := &Engine{AllowedRoots: func() []string { return []string{root} }}
+	if err := e.ValidateExternalFiles(mkv, []string{inside}); err != nil {
+		t.Errorf("file inside an allowed root rejected: %v", err)
+	}
+	if err := e.ValidateExternalFiles(mkv, []string{stray}); err == nil {
+		t.Error("file outside every allowed root was accepted")
+	}
+}
+
+func TestValidateExternalFiles_SymlinkCannotEscapeRoots(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	mkv := filepath.Join(root, "show.mkv")
+	if err := os.WriteFile(mkv, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(outside, "secret.srt")
+	if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "innocent.srt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	e := &Engine{AllowedRoots: func() []string { return []string{root} }}
+	if err := e.ValidateExternalFiles(mkv, []string{link}); err == nil {
+		t.Error("symlink pointing outside the allowed roots was accepted")
 	}
 }

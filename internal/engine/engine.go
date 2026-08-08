@@ -59,6 +59,12 @@ type Engine struct {
 	Prober     *probe.Prober
 	RecycleDir string // "" deletes sidecars permanently
 
+	// AllowedRoots reports the directories external merge inputs may be read
+	// from, re-evaluated per call because libraries change at runtime. A nil
+	// provider disables the check (CLI use); a provider that returns nothing
+	// denies every external file.
+	AllowedRoots func() []string
+
 	once        sync.Once
 	ffmpeg      string
 	mkvmerge    string
@@ -320,7 +326,7 @@ func (e *Engine) MergeTracks(ctx context.Context, path string, spec MergeSpec) (
 		return nil, errors.New("track merging requires a Matroska file")
 	}
 
-	if err := validateExternalFiles(path, spec.ExternalFiles); err != nil {
+	if err := e.ValidateExternalFiles(path, spec.ExternalFiles); err != nil {
 		return nil, err
 	}
 
@@ -374,10 +380,17 @@ func (e *Engine) MergeTracks(ctx context.Context, path string, spec MergeSpec) (
 	}, nil
 }
 
-func validateExternalFiles(path string, files []string) error {
+// ValidateExternalFiles vets merge inputs before they reach mkvmerge. Callers
+// in the API and the job runner share it so the rules cannot drift apart.
+func (e *Engine) ValidateExternalFiles(path string, files []string) error {
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		return err
+	}
+	var roots []string
+	restrict := e != nil && e.AllowedRoots != nil
+	if restrict {
+		roots = resolveRoots(e.AllowedRoots())
 	}
 	seenExt := map[string]bool{}
 	for _, ext := range files {
@@ -393,9 +406,15 @@ func validateExternalFiles(path string, files []string) error {
 		}
 		seenExt[absExt] = true
 
+		// Resolve before the containment check: a symlink inside a library
+		// can point anywhere, and mkvmerge reads the target.
+		if restrict && !pathWithin(realPath(absExt), roots) {
+			return fmt.Errorf("external file %s is outside the allowed roots", ext)
+		}
+
 		fi, err := os.Stat(ext)
 		if err != nil {
-			return fmt.Errorf("external file %s: %w", ext, err)
+			return fmt.Errorf("external file %s is not accessible", ext)
 		}
 		if fi.IsDir() {
 			return fmt.Errorf("external file %s is a directory", ext)
@@ -405,6 +424,32 @@ func validateExternalFiles(path string, files []string) error {
 		}
 	}
 	return nil
+}
+
+func realPath(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	return filepath.Clean(path)
+}
+
+func resolveRoots(roots []string) []string {
+	out := make([]string, 0, len(roots))
+	for _, r := range roots {
+		if r = strings.TrimSpace(r); r != "" {
+			out = append(out, realPath(r))
+		}
+	}
+	return out
+}
+
+func pathWithin(path string, roots []string) bool {
+	for _, root := range roots {
+		if path == root || strings.HasPrefix(path+string(filepath.Separator), root+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 // verifyMerge checks that a merge output has at least as many tracks as the

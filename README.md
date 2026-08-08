@@ -62,6 +62,8 @@ services:
 | `MUXPRUNE_AUTOSCAN_DEFAULT` | Default auto-scan interval (seconds) for newly added libraries; `0` disables, minimum `60` | `21600` (6h) |
 | `MUXPRUNE_WATCH` | Enable the real-time filesystem watcher (`0`/`false`/`off` uses periodic scans only) | `1` (on) |
 | `MUXPRUNE_API_KEY` | Optional authorization key for the REST API | (none, open API) |
+| `MUXPRUNE_BROWSE_ROOTS` | Colon-separated directories the folder picker may list, and the only places external merge inputs may come from. Unset falls back to your library paths plus conventional media mounts (`/media`, `/mnt`, `/data`, `/tv`, `/movies`, `/music`, `/srv`, `/storage`, `/Volumes`) and your home directory | (see left) |
+| `MUXPRUNE_SECURE_COOKIE` | Force the `Secure` flag on the session cookie. Only needed behind a TLS-terminating proxy that does not set `X-Forwarded-Proto` | `0` (auto-detected) |
 | `PUID` / `PGID` | User and Group ID mapping to match media folder ownership | `1000`/`1000` |
 | `UMASK` | File permissions mask for newly created files | `022` |
 

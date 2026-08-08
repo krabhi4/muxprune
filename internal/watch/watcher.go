@@ -136,6 +136,8 @@ func (w *libWatcher) addRecursive(root string) {
 }
 
 func (w *libWatcher) addWatch(path string) bool {
+	// The limit check and the counter increment stay under one lock so the
+	// pair cannot interleave if a second caller is ever added.
 	w.mu.Lock()
 	if w.watchLimit > 0 && w.watches >= w.watchLimit {
 		degraded := w.degraded
@@ -146,12 +148,9 @@ func (w *libWatcher) addWatch(path string) bool {
 		}
 		return false
 	}
-	w.mu.Unlock()
-	if err := w.fsw.Add(path); err != nil {
-		return true
+	if err := w.fsw.Add(path); err == nil {
+		w.watches++
 	}
-	w.mu.Lock()
-	w.watches++
 	w.mu.Unlock()
 	return true
 }

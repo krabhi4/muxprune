@@ -136,6 +136,8 @@ func main() {
 
 var version = "dev"
 
+func init() { api.Version = version }
+
 func runServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	port := fs.Int("port", envIntIn("MUXPRUNE_PORT", 8484, 1, 65535), "listen port")
@@ -168,6 +170,7 @@ func runServe(args []string) error {
 	}
 	hub := api.NewHub()
 	eng := &engine.Engine{Prober: prober}
+	eng.AllowedRoots = mergeRoots(st, browseRoots())
 	if *recycleDays > 0 {
 		eng.RecycleDir = filepath.Join(*configDir, "recycle")
 	}
@@ -178,11 +181,13 @@ func runServe(args []string) error {
 	srv := &api.Server{Store: st, Scanner: scanner, Runner: runner, Engine: eng, Hub: hub, APIKey: *apiKey,
 		WebhookSecret:           webhookSecret,
 		BrowseRoots:             roots,
+		SecureCookie:            envBool("MUXPRUNE_SECURE_COOKIE", false),
 		DefaultAutoScanInterval: envIntIn("MUXPRUNE_AUTOSCAN_DEFAULT", 21600, 0, 31536000)}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	srv.StartJanitor(ctx)
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() { defer wg.Done(); runner.Start(ctx, *workers) }()
@@ -231,6 +236,21 @@ func runServe(args []string) error {
 	return nil
 }
 
+// mergeRoots bounds where external merge inputs may come from: the configured
+// browse roots plus every library path, re-read per call so a library added
+// after startup is honoured.
+func mergeRoots(st *store.Store, configured []string) func() []string {
+	return func() []string {
+		roots := append([]string(nil), configured...)
+		if libs, err := st.ListLibraries(); err == nil {
+			for _, l := range libs {
+				roots = append(roots, l.Path)
+			}
+		}
+		return roots
+	}
+}
+
 func browseRoots() []string {
 	raw := env("MUXPRUNE_BROWSE_ROOTS", "")
 	if raw == "" {
@@ -268,6 +288,7 @@ func runMCP(args []string) error {
 	}
 	hub := api.NewHub()
 	eng := &engine.Engine{Prober: prober}
+	eng.AllowedRoots = mergeRoots(st, browseRoots())
 	if *recycleDays > 0 {
 		eng.RecycleDir = filepath.Join(*configDir, "recycle")
 	}
@@ -283,6 +304,7 @@ func runMCP(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	srv.StartJanitor(ctx)
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() { defer wg.Done(); runner.Start(ctx, *workers) }()

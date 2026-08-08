@@ -2,13 +2,13 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io/fs"
 	"net"
 	"net/http"
@@ -49,16 +49,44 @@ type Server struct {
 
 	DefaultAutoScanInterval int
 
+	// SecureCookie forces the Secure flag on the session cookie even when the
+	// request did not arrive over TLS. Needed behind proxies that terminate
+	// TLS without setting X-Forwarded-Proto.
+	SecureCookie bool
+
 	mcpMu       sync.Mutex
-	mcpSessions map[string]chan []byte
+	mcpSessions map[string]*mcpSession
 
 	limiter authLimiter
 
+	readLimiter  rateLimiter
+	writeLimiter rateLimiter
+	limiterOnce  sync.Once
+
 	sessMu   sync.Mutex
-	sessions map[string]time.Time
+	sessions map[string]*session
 }
 
 const sessionCookie = "mp_session"
+
+// csrfHeader is required on cookie-authenticated state-changing requests. A
+// browser cannot set a custom header on a cross-origin request without a
+// preflight the server never approves, so its presence proves the request did
+// not originate from an attacker's page.
+const csrfHeader = "X-Requested-With"
+
+const csrfValue = "muxprune"
+
+// Request size ceilings. Every one of these is reachable by an authenticated
+// caller and each item costs a query, a stat, or an argv entry.
+const (
+	maxBatchFileIDs   = 1000
+	maxStreamIndexes  = 100
+	maxMetadataEdits  = 100
+	maxExternalFiles  = 100
+	maxTrackOrder     = 1000
+	maxSidecarDeletes = 1000
+)
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -118,27 +146,49 @@ func protectedPath(path string) bool {
 	return strings.HasPrefix(path, "/api/") || path == "/sse"
 }
 
-func (s *Server) authenticated(r *http.Request) bool {
+// authMethod records how a request proved itself, because a cookie-borne
+// identity is attacker-triggerable from another origin and an API key is not.
+type authMethod int
+
+const (
+	authNone authMethod = iota
+	authKey
+	authCookie
+)
+
+func (s *Server) authenticate(r *http.Request) authMethod {
 	if key := r.Header.Get("X-Api-Key"); key != "" {
-		return constantTimeEqual(key, s.APIKey)
+		if constantTimeEqual(key, s.APIKey) {
+			return authKey
+		}
+		return authNone
 	}
-	if c, err := r.Cookie(sessionCookie); err == nil {
-		return s.sessionValid(c.Value)
+	if c, err := r.Cookie(sessionCookie); err == nil && s.sessionValid(c.Value) {
+		return authCookie
 	}
-	return false
+	return authNone
 }
 
-const sessionTTL = 30 * 24 * time.Hour
+const (
+	sessionTTL     = 30 * 24 * time.Hour
+	sessionIdleTTL = 24 * time.Hour
+)
+
+type session struct {
+	expires  time.Time
+	lastSeen time.Time
+}
 
 func (s *Server) newSession() string {
 	b := make([]byte, 32)
 	rand.Read(b)
 	tok := hex.EncodeToString(b)
+	now := time.Now()
 	s.sessMu.Lock()
 	if s.sessions == nil {
-		s.sessions = map[string]time.Time{}
+		s.sessions = map[string]*session{}
 	}
-	s.sessions[tok] = time.Now().Add(sessionTTL)
+	s.sessions[tok] = &session{expires: now.Add(sessionTTL), lastSeen: now}
 	s.sessMu.Unlock()
 	return tok
 }
@@ -146,15 +196,80 @@ func (s *Server) newSession() string {
 func (s *Server) sessionValid(tok string) bool {
 	s.sessMu.Lock()
 	defer s.sessMu.Unlock()
-	exp, ok := s.sessions[tok]
+	sess, ok := s.sessions[tok]
 	if !ok {
 		return false
 	}
-	if time.Now().After(exp) {
+	now := time.Now()
+	if now.After(sess.expires) || now.Sub(sess.lastSeen) > sessionIdleTTL {
 		delete(s.sessions, tok)
 		return false
 	}
+	sess.lastSeen = now
 	return true
+}
+
+func (s *Server) sweepSessions() {
+	now := time.Now()
+	s.sessMu.Lock()
+	defer s.sessMu.Unlock()
+	for tok, sess := range s.sessions {
+		if now.After(sess.expires) || now.Sub(sess.lastSeen) > sessionIdleTTL {
+			delete(s.sessions, tok)
+		}
+	}
+}
+
+// StartJanitor drops expired sessions and stale rate-limiter entries that no
+// request will ever touch again. Without it both maps only shrink when the
+// same token or IP comes back.
+func (s *Server) StartJanitor(ctx context.Context) {
+	go func() {
+		t := time.NewTicker(10 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				s.sweepSessions()
+				s.limiter.sweep()
+				s.readLimiter.sweep()
+				s.writeLimiter.sweep()
+			}
+		}
+	}()
+}
+
+func mutatingMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	}
+	return true
+}
+
+const (
+	readRateLimit   = 600
+	writeRateLimit  = 120
+	rateLimitWindow = time.Minute
+)
+
+func (s *Server) initLimiters() {
+	s.limiterOnce.Do(func() {
+		s.readLimiter.limit, s.readLimiter.window = readRateLimit, rateLimitWindow
+		s.writeLimiter.limit, s.writeLimiter.window = writeRateLimit, rateLimitWindow
+	})
+}
+
+// rateAllowed throttles authenticated traffic. Failed logins are handled
+// separately by authLimiter; this covers everything that gets past the door.
+func (s *Server) rateAllowed(r *http.Request) bool {
+	s.initLimiters()
+	if mutatingMethod(r.Method) {
+		return s.writeLimiter.allow(clientIP(r))
+	}
+	return s.readLimiter.allow(clientIP(r))
 }
 
 func (s *Server) auth(next http.Handler) http.Handler {
@@ -173,6 +288,10 @@ func (s *Server) auth(next http.Handler) http.Handler {
 				return
 			}
 		}
+		if !s.rateAllowed(r) {
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limit exceeded; slow down"})
+			return
+		}
 		if s.APIKey == "" {
 			next.ServeHTTP(w, r)
 			return
@@ -182,9 +301,15 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many failed auth attempts; try again later"})
 			return
 		}
-		if !s.authenticated(r) {
+		method := s.authenticate(r)
+		if method == authNone {
 			s.limiter.fail(ip)
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid api key"})
+			return
+		}
+		if method == authCookie && mutatingMethod(r.Method) && r.Header.Get(csrfHeader) != csrfValue {
+			writeJSON(w, http.StatusForbidden,
+				map[string]string{"error": "missing " + csrfHeader + " header on a cookie-authenticated request"})
 			return
 		}
 		s.limiter.reset(ip)
@@ -241,6 +366,16 @@ func (l *authLimiter) reset(ip string) {
 	delete(l.fails, ip)
 }
 
+func (l *authLimiter) sweep() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for ip, fw := range l.fails {
+		if time.Since(fw.start) > authFailWindow {
+			delete(l.fails, ip)
+		}
+	}
+}
+
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -252,8 +387,17 @@ func clientIP(r *http.Request) string {
 func (s *Server) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
-		w.Header().Set("Content-Security-Policy",
-			"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'self'; form-action 'self'")
+		h := w.Header()
+		h.Set("Content-Security-Policy",
+			"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "no-referrer")
+		// HSTS is only meaningful on a connection the browser already trusts;
+		// muxprune serves plain HTTP and expects a TLS-terminating proxy.
+		if requestIsTLS(r) {
+			h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -264,6 +408,7 @@ func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
 		Value:    s.newSession(),
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   s.SecureCookie || requestIsTLS(r),
 		SameSite: http.SameSiteStrictMode,
 		MaxAge:   int(sessionTTL / time.Second),
 	})
@@ -276,16 +421,28 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
+// writeErr never echoes an error it did not author. Raw database, filesystem,
+// and external-tool messages leak internal paths and schema, so they are
+// logged here and replaced with a generic message for the client.
 func writeErr(w http.ResponseWriter, code int, err error) {
 	var mbe *http.MaxBytesError
 	if errors.As(err, &mbe) {
-		code = http.StatusRequestEntityTooLarge
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request body too large"})
+		return
 	}
-	writeJSON(w, code, map[string]string{"error": err.Error()})
+	msg, logIt := safeMessage(code, err)
+	if logIt {
+		logInternal(code, err)
+	}
+	writeJSON(w, code, map[string]string{"error": msg})
 }
 
 func pathID(r *http.Request) (int64, error) {
-	return strconv.ParseInt(r.PathValue("id"), 10, 64)
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		return 0, cerr("invalid id")
+	}
+	return id, nil
 }
 
 // ---- stats / libraries ----
@@ -304,16 +461,29 @@ func (s *Server) handleBrowse(w http.ResponseWriter, r *http.Request) {
 	if path == "" {
 		path = "/"
 	}
-	path = filepath.Clean(path)
+	// Resolve symlinks before the allow-list check: a link inside a root can
+	// point anywhere, and os.ReadDir follows it.
+	path = realPath(filepath.Clean(path))
+	roots := s.resolvedBrowseRoots()
 
-	if roots := s.effectiveBrowseRoots(); len(roots) > 0 && !pathAllowed(path, roots) {
-		writeErr(w, 403, errors.New("path is outside the allowed roots"))
+	if !pathAllowed(path, roots) {
+		// Still let the picker walk down to a root through its ancestors,
+		// listing only the segments that lead there.
+		if dirs := rootChildren(path, roots); len(dirs) > 0 {
+			writeJSON(w, 200, map[string]any{
+				"current":     path,
+				"parent":      browseParent(path),
+				"directories": dirs,
+			})
+			return
+		}
+		writeErr(w, 403, cerr("path is outside the allowed roots"))
 		return
 	}
 
 	entries, err := os.ReadDir(path)
 	if err != nil {
-		writeErr(w, 400, err)
+		writeErr(w, 400, cerr("path is not an accessible directory"))
 		return
 	}
 
@@ -325,41 +495,38 @@ func (s *Server) handleBrowse(w http.ResponseWriter, r *http.Request) {
 	}
 	slices.Sort(dirs)
 
-	parent := filepath.Dir(path)
-	if parent == path {
-		parent = ""
-	}
-
 	writeJSON(w, 200, map[string]any{
 		"current":     path,
-		"parent":      parent,
+		"parent":      browseParent(path),
 		"directories": dirs,
 	})
 }
 
+func browseParent(path string) string {
+	if parent := filepath.Dir(path); parent != path {
+		return parent
+	}
+	return ""
+}
+
+// effectiveBrowseRoots is the allow-list for the folder picker. It never
+// returns an empty slice: an empty allow-list used to mean "no restriction",
+// which exposed the whole filesystem on a fresh install.
 func (s *Server) effectiveBrowseRoots() []string {
 	if len(s.BrowseRoots) > 0 {
 		return s.BrowseRoots
 	}
-	libs, err := s.Store.ListLibraries()
-	if err != nil {
-		return nil
-	}
-	roots := make([]string, 0, len(libs))
-	for _, l := range libs {
-		roots = append(roots, l.Path)
-	}
-	return roots
-}
-
-func pathAllowed(path string, roots []string) bool {
-	for _, root := range roots {
-		root = filepath.Clean(root)
-		if path == root || strings.HasPrefix(path+string(filepath.Separator), root+string(filepath.Separator)) {
-			return true
+	var roots []string
+	if libs, err := s.Store.ListLibraries(); err == nil {
+		for _, l := range libs {
+			roots = append(roots, l.Path)
 		}
 	}
-	return false
+	return append(roots, defaultBrowseRoots()...)
+}
+
+func (s *Server) resolvedBrowseRoots() []string {
+	return resolveRoots(s.effectiveBrowseRoots())
 }
 
 type libraryView struct {
@@ -418,7 +585,10 @@ func decodeLibraryReq(r *http.Request) (*libraryRequest, error) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		return nil, err
 	}
-	req.Path = filepath.Clean(req.Path)
+	// Store the resolved path: os.Stat and the scanner both follow symlinks,
+	// so validating the link name instead of its target would let a library
+	// escape the configured roots.
+	req.Path = realPath(filepath.Clean(req.Path))
 	if req.Name == "" {
 		req.Name = filepath.Base(req.Path)
 	}
@@ -430,9 +600,19 @@ func decodeLibraryReq(r *http.Request) (*libraryRequest, error) {
 	}
 	info, err := os.Stat(req.Path)
 	if err != nil || !info.IsDir() {
-		return nil, fmt.Errorf("path is not an accessible directory: %s", req.Path)
+		return nil, cerr("path is not an accessible directory")
 	}
 	return &req, nil
+}
+
+// libraryPathAllowed jails library paths to the configured browse roots. An
+// unset MUXPRUNE_BROWSE_ROOTS keeps the historical behaviour of allowing any
+// path, because the operator has not expressed a boundary to enforce.
+func (s *Server) libraryPathAllowed(path string) bool {
+	if len(s.BrowseRoots) == 0 {
+		return true
+	}
+	return pathAllowed(realPath(path), resolveRoots(s.BrowseRoots))
 }
 
 func (s *Server) handleAddLibrary(w http.ResponseWriter, r *http.Request) {
@@ -441,8 +621,8 @@ func (s *Server) handleAddLibrary(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
-	if len(s.BrowseRoots) > 0 && !pathAllowed(req.Path, s.BrowseRoots) {
-		writeErr(w, 403, errors.New("library path is outside the allowed roots"))
+	if !s.libraryPathAllowed(req.Path) {
+		writeErr(w, 403, cerr("library path is outside the allowed roots"))
 		return
 	}
 	interval := s.DefaultAutoScanInterval
@@ -477,7 +657,7 @@ func (s *Server) handleUpdateLibrary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if existing == nil {
-		writeErr(w, 404, errors.New("library not found"))
+		writeErr(w, 404, cerr("library not found"))
 		return
 	}
 	req, err := decodeLibraryReq(r)
@@ -485,8 +665,8 @@ func (s *Server) handleUpdateLibrary(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
-	if len(s.BrowseRoots) > 0 && !pathAllowed(req.Path, s.BrowseRoots) {
-		writeErr(w, 403, errors.New("library path is outside the allowed roots"))
+	if !s.libraryPathAllowed(req.Path) {
+		writeErr(w, 403, cerr("library path is outside the allowed roots"))
 		return
 	}
 	l := &store.Library{
@@ -533,7 +713,7 @@ func (s *Server) handleScanLibrary(w http.ResponseWriter, r *http.Request) {
 	}
 	lib, err := s.Store.GetLibrary(id)
 	if err != nil || lib == nil {
-		writeErr(w, 404, errors.New("library not found"))
+		writeErr(w, 404, cerr("library not found"))
 		return
 	}
 	active, err := s.Store.IsScanActive(lib.ID)
@@ -636,7 +816,7 @@ func (s *Server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if d == nil {
-		writeErr(w, 404, errors.New("file not found"))
+		writeErr(w, 404, cerr("file not found"))
 		return
 	}
 	writeJSON(w, 200, d)
@@ -664,13 +844,21 @@ func (s *Server) handleFileJobs(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
+	if len(req.RemoveAudio) > maxStreamIndexes || len(req.RemoveSubs) > maxStreamIndexes {
+		writeErr(w, 400, cerr("remove_audio/remove_subs exceed the limit of %d entries", maxStreamIndexes))
+		return
+	}
+	if len(req.DeleteSidecars) > maxSidecarDeletes {
+		writeErr(w, 400, cerr("delete_sidecars exceeds the limit of %d entries", maxSidecarDeletes))
+		return
+	}
 	d, _, err := s.loadDetail(id)
 	if err != nil {
 		writeErr(w, 500, err)
 		return
 	}
 	if d == nil {
-		writeErr(w, 404, errors.New("file not found"))
+		writeErr(w, 404, cerr("file not found"))
 		return
 	}
 
@@ -724,7 +912,7 @@ func (s *Server) enqueueForFile(d *fileDetail, req fileJobRequest) ([]*store.Job
 			return nil, err
 		}
 		if sc == nil || sc.FileID != d.ID {
-			return nil, fmt.Errorf("sidecar %d does not belong to file %d", scID, d.ID)
+			return nil, cerr("sidecar %d does not belong to file %d", scID, d.ID)
 		}
 		j, err := s.Store.CreateJob("delete_sidecar", d.ID, d.Path, jobs.SidecarPayload{
 			SidecarID: sc.ID, Path: sc.Path,
@@ -735,7 +923,7 @@ func (s *Server) enqueueForFile(d *fileDetail, req fileJobRequest) ([]*store.Job
 		created = append(created, j)
 	}
 	if len(created) == 0 {
-		return nil, errors.New("nothing to do")
+		return nil, cerr("nothing to do")
 	}
 	return created, nil
 }
@@ -758,7 +946,11 @@ func (s *Server) handleEditMetadata(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(req.Edits) == 0 {
-		writeErr(w, 400, errors.New("edits required"))
+		writeErr(w, 400, cerr("edits required"))
+		return
+	}
+	if len(req.Edits) > maxMetadataEdits {
+		writeErr(w, 400, cerr("edits exceeds the limit of %d", maxMetadataEdits))
 		return
 	}
 	d, res, err := s.loadDetail(id)
@@ -767,11 +959,11 @@ func (s *Server) handleEditMetadata(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if d == nil {
-		writeErr(w, 404, errors.New("file not found"))
+		writeErr(w, 404, cerr("file not found"))
 		return
 	}
 	if res == nil || !res.IsMatroska() {
-		writeErr(w, 400, errors.New("file is not a Matroska container; metadata editing requires MKV"))
+		writeErr(w, 400, cerr("file is not a Matroska container; metadata editing requires MKV"))
 		return
 	}
 	j, err := s.Store.CreateJob("edit_metadata", d.ID, d.Path, jobs.EditMetadataPayload{
@@ -803,7 +995,11 @@ func (s *Server) handleReorderTracks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(req.TrackOrder) == 0 {
-		writeErr(w, 400, errors.New("track_order is required"))
+		writeErr(w, 400, cerr("track_order is required"))
+		return
+	}
+	if len(req.TrackOrder) > maxTrackOrder {
+		writeErr(w, 400, cerr("track_order exceeds the limit of %d entries", maxTrackOrder))
 		return
 	}
 	d, res, err := s.loadDetail(id)
@@ -812,11 +1008,11 @@ func (s *Server) handleReorderTracks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if d == nil {
-		writeErr(w, 404, errors.New("file not found"))
+		writeErr(w, 404, cerr("file not found"))
 		return
 	}
 	if res == nil || !res.IsMatroska() {
-		writeErr(w, 400, errors.New("file is not a Matroska container; track reordering requires MKV"))
+		writeErr(w, 400, cerr("file is not a Matroska container; track reordering requires MKV"))
 		return
 	}
 	byIdx := map[int]probe.Stream{}
@@ -830,24 +1026,24 @@ func (s *Server) handleReorderTracks(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if len(req.TrackOrder) != expectedCount {
-		writeErr(w, 400, fmt.Errorf("track order must contain exactly %d tracks, got %d", expectedCount, len(req.TrackOrder)))
+		writeErr(w, 400, cerr("track order must contain exactly %d tracks, got %d", expectedCount, len(req.TrackOrder)))
 		return
 	}
 	seen := map[int]bool{}
 	for _, idx := range req.TrackOrder {
 		if seen[idx] {
-			writeErr(w, 400, fmt.Errorf("duplicate stream index %d in track order", idx))
+			writeErr(w, 400, cerr("duplicate stream index %d in track order", idx))
 			return
 		}
 		seen[idx] = true
 
 		st, ok := byIdx[idx]
 		if !ok {
-			writeErr(w, 400, fmt.Errorf("stream index %d not found", idx))
+			writeErr(w, 400, cerr("stream index %d not found", idx))
 			return
 		}
 		if st.MkvID < 0 {
-			writeErr(w, 400, fmt.Errorf("stream index %d has no mkvmerge track ID", idx))
+			writeErr(w, 400, cerr("stream index %d has no mkvmerge track ID", idx))
 			return
 		}
 	}
@@ -867,6 +1063,19 @@ type mergeTracksRequest struct {
 	ExternalFiles []string `json:"external_files"`
 }
 
+// validateExternalFiles defers to the engine so the REST API, the MCP tools,
+// and the job runner all apply the same rules, including containment in the
+// allowed roots. Engine messages here are authored, not wrapped OS errors.
+func (s *Server) validateExternalFiles(target string, files []string) error {
+	if s.Engine == nil {
+		return nil
+	}
+	if err := s.Engine.ValidateExternalFiles(target, files); err != nil {
+		return cerr("%s", err.Error())
+	}
+	return nil
+}
+
 func (s *Server) handleMergeTracks(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
@@ -879,7 +1088,11 @@ func (s *Server) handleMergeTracks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(req.ExternalFiles) == 0 {
-		writeErr(w, 400, errors.New("external_files is required"))
+		writeErr(w, 400, cerr("external_files is required"))
+		return
+	}
+	if len(req.ExternalFiles) > maxExternalFiles {
+		writeErr(w, 400, cerr("external_files exceeds the limit of %d", maxExternalFiles))
 		return
 	}
 	d, res, err := s.loadDetail(id)
@@ -888,44 +1101,16 @@ func (s *Server) handleMergeTracks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if d == nil {
-		writeErr(w, 404, errors.New("file not found"))
+		writeErr(w, 404, cerr("file not found"))
 		return
 	}
 	if res == nil || !res.IsMatroska() {
-		writeErr(w, 400, errors.New("file is not a Matroska container; merging tracks requires MKV"))
+		writeErr(w, 400, cerr("file is not a Matroska container; merging tracks requires MKV"))
 		return
 	}
-	absPath, err := filepath.Abs(d.Path)
-	if err != nil {
-		writeErr(w, 500, err)
+	if err := s.validateExternalFiles(d.Path, req.ExternalFiles); err != nil {
+		writeErr(w, 400, err)
 		return
-	}
-	seenExt := map[string]bool{}
-	for _, ext := range req.ExternalFiles {
-		absExt, err := filepath.Abs(ext)
-		if err != nil {
-			writeErr(w, 400, fmt.Errorf("external file %s path: %w", ext, err))
-			return
-		}
-		if absExt == absPath {
-			writeErr(w, 400, fmt.Errorf("cannot merge a file into itself: %s", ext))
-			return
-		}
-		if seenExt[absExt] {
-			writeErr(w, 400, fmt.Errorf("duplicate external file: %s", ext))
-			return
-		}
-		seenExt[absExt] = true
-
-		fi, err := os.Stat(ext)
-		if err != nil {
-			writeErr(w, 400, fmt.Errorf("external file %s: %w", ext, err))
-			return
-		}
-		if fi.IsDir() {
-			writeErr(w, 400, fmt.Errorf("external file %s is a directory", ext))
-			return
-		}
 	}
 	j, err := s.Store.CreateJob("merge_tracks", d.ID, d.Path, jobs.MergePayload{
 		ExternalFiles: req.ExternalFiles,
@@ -1016,7 +1201,11 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(req.FileIDs) == 0 {
-		writeErr(w, 400, errors.New("file_ids required"))
+		writeErr(w, 400, cerr("file_ids required"))
+		return
+	}
+	if len(req.FileIDs) > maxBatchFileIDs {
+		writeErr(w, 400, cerr("file_ids exceeds the limit of %d", maxBatchFileIDs))
 		return
 	}
 	var results []batchFileResult
@@ -1143,7 +1332,11 @@ func (s *Server) handleArrWebhook(w http.ResponseWriter, r *http.Request) {
 	for i := range libs {
 		if strings.HasPrefix(filepath.Clean(target)+string(filepath.Separator),
 			filepath.Clean(libs[i].Path)+string(filepath.Separator)) {
-			active, _ := s.Store.IsScanActive(libs[i].ID)
+			active, err := s.Store.IsScanActive(libs[i].ID)
+			if err != nil {
+				writeErr(w, 500, err)
+				return
+			}
 			if !active {
 				_, _ = s.Store.CreateJob("scan_library", 0, libs[i].Path, jobs.ScanLibraryPayload{LibraryID: libs[i].ID})
 				s.Runner.Wake()

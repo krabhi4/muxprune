@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-08-08
+
+Follow-up release to the 0.5.0 hardening pass. A full-codebase security audit produced 35
+findings; re-verifying each against the code confirmed 33 (3 were false positives) and
+surfaced 1 more the audit had missed. All 33 are addressed here.
+
+### Security
+- Filesystem browsing and library paths now resolve symlinks before the allow-list check. Previously a symlink inside an allowed root was validated by its own name while `os.ReadDir` and the scanner followed it to the target, so a link placed in a media folder could enumerate arbitrary directories or attach a library rooted outside the jail. Library paths are stored resolved.
+- Browsing no longer fails open. The jail was skipped entirely whenever the allow-list came back empty, which is the state of every fresh install (no `MUXPRUNE_BROWSE_ROOTS`, no libraries yet), leaving the whole filesystem enumerable through the folder picker. With nothing configured it now falls back to conventional media mounts (`/media`, `/mnt`, `/data`, `/tv`, `/movies`, `/music`, `/srv`, `/storage`, `/Volumes`) plus the home directory, and walking down to a root through a parent directory lists only the segments that lead there.
+- External merge inputs are confined to the allowed roots (browse roots plus every library path), resolved through symlinks first. Track merging previously accepted any path on the host that mkvmerge could read. The REST handler, the MCP tool, and the job runner now share one validator instead of three drifting copies.
+- The session cookie carries `Secure` when the request arrived over TLS or through a proxy setting `X-Forwarded-Proto: https`, and `MUXPRUNE_SECURE_COOKIE=1` forces it for proxies that set neither. It is not set unconditionally, which would make the cookie unusable on the plain-HTTP loopback default.
+- Cookie-authenticated state-changing requests must carry `X-Requested-With: muxprune`. `SameSite=Strict` already blocked the classic cross-site form post; this closes the gap for clients that do not enforce it. API-key requests and all reads are exempt.
+- API and MCP responses no longer echo raw database, filesystem, or external-tool error text. Messages authored by muxprune are returned verbatim; everything else is logged server-side and replaced with a generic message, so `os.Stat` and `os.ReadDir` failures stop working as a filesystem probe.
+- Authenticated traffic is rate limited per client IP (600 reads and 120 writes per minute) rather than only failed logins.
+- Sessions expire after 24 hours of inactivity in addition to the 30-day absolute TTL, so an abandoned or stolen token is not usable for a month.
+- Every array input is bounded on both the REST API and the MCP tools: 1000 batch file ids, 100 stream indexes, 100 metadata edits, 100 external merge files, 1000 track-order entries. Deep pagination is clamped (offset capped at 100,000) so a large `OFFSET` cannot make SQLite walk and discard the whole table, and job logs are capped at 4000 characters before they reach the database.
+- Response headers: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and CSP `frame-ancestors 'none'` on every response including the SSE streams. `Strict-Transport-Security` is emitted only when the request came over TLS, since a browser ignores it on a plain-HTTP origin and setting it unconditionally would only mislead operators.
+
+### Changed
+- **Breaking:** cookie-authenticated `POST`/`PUT`/`DELETE` requests without `X-Requested-With: muxprune` are rejected with `403`. The bundled Web UI sends it. Third-party scripts using the session cookie must add the header or switch to `X-Api-Key`, which is unaffected.
+- **Breaking:** error responses for internal failures now read `internal error` or `invalid request` instead of the underlying error text. Clients matching on database or filesystem error strings need updating; validation messages authored by the API are unchanged.
+- Browsing on a fresh install is restricted to the bootstrap roots listed above instead of the entire filesystem. Set `MUXPRUNE_BROWSE_ROOTS` to browse anywhere else.
+- The MCP handshake reports the real build version instead of a hardcoded `v0.2.0` that had not tracked a release since 0.2.
+
+### Fixed
+- The stdio MCP server (`muxprune mcp`) no longer blocks shutdown until a newline arrives on stdin. Cancellation was only checked between reads, so an idle session ignored SIGTERM until the client happened to send something; it now exits immediately.
+- MCP requests detached from a disconnected HTTP client no longer run forever. Work is bound to the SSE session's lifetime instead of being made uncancellable.
+- The Sonarr/Radarr webhook no longer queues a duplicate scan when the "is a scan already running" check fails: the error was discarded and treated as "not running".
+- Non-positive and unparseable path ids (`/api/v1/files/0`, `/-1`, `/abc`) return `400` instead of falling through to a database lookup and a misleading `404`.
+- The session and authentication rate-limiter maps no longer grow without bound. Both only shrank when the same token or IP came back; a background sweep now drops entries that nothing will touch again.
+- The library watcher's watch-limit check and counter increment happen under a single lock. The pair was split across an unlock/relock window that no current caller could interleave, but the invariant no longer depends on that.
+
 ## [0.5.0] - 2026-07-17
 
 ### Security

@@ -27,7 +27,9 @@ async function ensureSession() {
 }
 
 async function api(path, opts = {}) {
-  const headers = { ...(opts.headers || {}) };
+  // Proves the request came from this origin: browsers cannot set a custom
+  // header cross-origin without a preflight the server never approves.
+  const headers = { "X-Requested-With": "muxprune", ...(opts.headers || {}) };
   if (opts.body && typeof opts.body !== "string") {
     opts.body = JSON.stringify(opts.body);
     headers["Content-Type"] = "application/json";

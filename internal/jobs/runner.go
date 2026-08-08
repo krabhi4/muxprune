@@ -182,11 +182,23 @@ func (r *Runner) run(ctx context.Context, job *store.Job) {
 	if status, log = finalStatus(wasCancelled, killed, status, log); status == "cancelled" {
 		saved = 0
 	}
+	log = clampLog(log)
 	if err := r.Store.FinishJob(job.ID, status, log, saved); err != nil {
 		fmt.Printf("jobs: finish %d: %v\n", job.ID, err)
 	}
 	r.notify(map[string]any{"id": job.ID, "status": status, "type": job.Type,
 		"file_path": job.FilePath, "bytes_saved": saved, "log": log})
+}
+
+// maxJobLog bounds what a job writes to the database and hands back over the
+// API. Tool stderr is already tailed by the engine; this catches the rest.
+const maxJobLog = 4000
+
+func clampLog(s string) string {
+	if len(s) <= maxJobLog {
+		return s
+	}
+	return s[:maxJobLog] + " ...[truncated]"
 }
 
 func (r *Runner) execute(ctx context.Context, job *store.Job) (status, log string, saved int64) {

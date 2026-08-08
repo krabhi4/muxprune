@@ -535,3 +535,40 @@ func TestRetryJob_IncrementsAttempts(t *testing.T) {
 		t.Errorf("persisted attempts = %d, want 2", got.Attempts)
 	}
 }
+
+func TestListFiles_ClampsOffset(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	lib := &Library{Name: "L", Path: "/x", Kind: "other", HardlinkPolicy: "skip"}
+	if err := s.AddLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertMediaFile(&MediaFile{LibraryID: lib.ID, Path: "/x/a.mkv", Size: 1}); err != nil {
+		t.Fatal(err)
+	}
+	// A caller-supplied offset in the billions makes SQLite walk every row.
+	f := FileFilter{Offset: 1 << 40}
+	if _, _, err := s.ListFiles(f); err != nil {
+		t.Fatalf("huge offset: %v", err)
+	}
+	if _, _, err := s.ListFiles(FileFilter{Offset: -5}); err != nil {
+		t.Fatalf("negative offset: %v", err)
+	}
+}
+
+func TestListJobs_ClampsOffset(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.CreateJob("remux", 0, "/x/a.mkv", map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.ListJobs("", 10, 1<<40); err != nil {
+		t.Fatalf("huge offset: %v", err)
+	}
+}

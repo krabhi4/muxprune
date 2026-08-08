@@ -11,7 +11,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 
 	"github.com/krabhi4/muxprune/internal/engine"
 	"github.com/krabhi4/muxprune/internal/jobs"
@@ -46,16 +45,33 @@ func (s *Server) ServeMCP(ctx context.Context) error {
 	// Redirect any standard fmt.Printf or log output to stderr to keep stdout clean.
 	os.Stdout = os.Stderr
 
-	reader := bufio.NewReader(os.Stdin)
+	// ReadBytes blocks until a newline arrives, so the read runs on its own
+	// goroutine and shutdown selects on ctx instead of waiting for input.
+	type readResult struct {
+		line []byte
+		err  error
+	}
+	lines := make(chan readResult, 1)
+	go func() {
+		reader := bufio.NewReader(os.Stdin)
+		for {
+			line, err := reader.ReadBytes('\n')
+			lines <- readResult{line: line, err: err}
+			if err != nil {
+				return
+			}
+		}
+	}()
 
 	for {
+		var rr readResult
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
+		case rr = <-lines:
 		}
 
-		line, err := reader.ReadBytes('\n')
+		line, err := rr.line, rr.err
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return nil
@@ -87,7 +103,7 @@ func (s *Server) handleMCPRequest(ctx context.Context, w io.Writer, req *jsonRPC
 			},
 			"serverInfo": map[string]any{
 				"name":    "muxprune-mcp",
-				"version": "v0.2.0",
+				"version": Version,
 			},
 		})
 
@@ -286,7 +302,7 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 	case "list_libraries":
 		libs, err := s.Store.ListLibraries()
 		if err != nil {
-			sendMCPToolError(w, id, err.Error())
+			sendMCPToolError(w, id, mcpErrMsg(err))
 			return
 		}
 		b, _ := json.MarshalIndent(libs, "", "  ")
@@ -320,7 +336,7 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 			Offset:    filter.Offset,
 		})
 		if err != nil {
-			sendMCPToolError(w, id, err.Error())
+			sendMCPToolError(w, id, mcpErrMsg(err))
 			return
 		}
 		b, _ := json.MarshalIndent(files, "", "  ")
@@ -336,7 +352,7 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 		}
 		detail, _, err := s.loadDetail(fArgs.ID)
 		if err != nil {
-			sendMCPToolError(w, id, err.Error())
+			sendMCPToolError(w, id, mcpErrMsg(err))
 			return
 		}
 		if detail == nil {
@@ -357,9 +373,13 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 			sendMCPToolError(w, id, "Invalid or missing 'file_id' argument")
 			return
 		}
+		if len(sArgs.AudioIdx) > maxStreamIndexes || len(sArgs.SubIdx) > maxStreamIndexes {
+			sendMCPToolError(w, id, fmt.Sprintf("audio_idx/sub_idx exceed the limit of %d entries", maxStreamIndexes))
+			return
+		}
 		detail, _, err := s.loadDetail(sArgs.FileID)
 		if err != nil {
-			sendMCPToolError(w, id, err.Error())
+			sendMCPToolError(w, id, mcpErrMsg(err))
 			return
 		}
 		if detail == nil {
@@ -376,7 +396,7 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 				AllowLastAudio: false,
 			})
 			if err != nil {
-				sendMCPToolError(w, id, err.Error())
+				sendMCPToolError(w, id, mcpErrMsg(err))
 				return
 			}
 			queued = append(queued, j)
@@ -394,9 +414,13 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 			sendMCPToolError(w, id, "Invalid arguments; edits list and file_id required")
 			return
 		}
+		if len(mArgs.Edits) > maxMetadataEdits {
+			sendMCPToolError(w, id, fmt.Sprintf("edits exceeds the limit of %d", maxMetadataEdits))
+			return
+		}
 		detail, res, err := s.loadDetail(mArgs.FileID)
 		if err != nil {
-			sendMCPToolError(w, id, err.Error())
+			sendMCPToolError(w, id, mcpErrMsg(err))
 			return
 		}
 		if detail == nil {
@@ -411,7 +435,7 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 			Edits: mArgs.Edits,
 		})
 		if err != nil {
-			sendMCPToolError(w, id, err.Error())
+			sendMCPToolError(w, id, mcpErrMsg(err))
 			return
 		}
 		s.Runner.Wake()
@@ -427,9 +451,13 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 			sendMCPToolError(w, id, "Invalid arguments; track_order list and file_id required")
 			return
 		}
+		if len(rArgs.TrackOrder) > maxTrackOrder {
+			sendMCPToolError(w, id, fmt.Sprintf("track_order exceeds the limit of %d entries", maxTrackOrder))
+			return
+		}
 		detail, res, err := s.loadDetail(rArgs.FileID)
 		if err != nil {
-			sendMCPToolError(w, id, err.Error())
+			sendMCPToolError(w, id, mcpErrMsg(err))
 			return
 		}
 		if detail == nil {
@@ -478,7 +506,7 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 			TrackOrder: rArgs.TrackOrder,
 		})
 		if err != nil {
-			sendMCPToolError(w, id, err.Error())
+			sendMCPToolError(w, id, mcpErrMsg(err))
 			return
 		}
 		s.Runner.Wake()
@@ -494,9 +522,13 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 			sendMCPToolError(w, id, "Invalid arguments; external_files list and file_id required")
 			return
 		}
+		if len(mArgs.ExternalFiles) > maxExternalFiles {
+			sendMCPToolError(w, id, fmt.Sprintf("external_files exceeds the limit of %d", maxExternalFiles))
+			return
+		}
 		detail, res, err := s.loadDetail(mArgs.FileID)
 		if err != nil {
-			sendMCPToolError(w, id, err.Error())
+			sendMCPToolError(w, id, mcpErrMsg(err))
 			return
 		}
 		if detail == nil {
@@ -508,45 +540,16 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 			return
 		}
 
-		// Resolve absolute paths and validate
-		absPath, err := filepath.Abs(detail.Path)
-		if err != nil {
-			sendMCPToolError(w, id, err.Error())
+		if err := s.validateExternalFiles(detail.Path, mArgs.ExternalFiles); err != nil {
+			sendMCPToolError(w, id, mcpErrMsg(err))
 			return
-		}
-		seenExt := map[string]bool{}
-		for _, ext := range mArgs.ExternalFiles {
-			absExt, err := filepath.Abs(ext)
-			if err != nil {
-				sendMCPToolError(w, id, fmt.Sprintf("external file %s path: %v", ext, err))
-				return
-			}
-			if absExt == absPath {
-				sendMCPToolError(w, id, fmt.Sprintf("cannot merge a file into itself: %s", ext))
-				return
-			}
-			if seenExt[absExt] {
-				sendMCPToolError(w, id, fmt.Sprintf("duplicate external file: %s", ext))
-				return
-			}
-			seenExt[absExt] = true
-
-			fi, err := os.Stat(ext)
-			if err != nil {
-				sendMCPToolError(w, id, fmt.Sprintf("external file %s: %v", ext, err))
-				return
-			}
-			if fi.IsDir() {
-				sendMCPToolError(w, id, fmt.Sprintf("external file %s is a directory", ext))
-				return
-			}
 		}
 
 		j, err := s.Store.CreateJob("merge_tracks", detail.ID, detail.Path, jobs.MergePayload{
 			ExternalFiles: mArgs.ExternalFiles,
 		})
 		if err != nil {
-			sendMCPToolError(w, id, err.Error())
+			sendMCPToolError(w, id, mcpErrMsg(err))
 			return
 		}
 		s.Runner.Wake()
@@ -563,7 +566,7 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 		}
 		job, err := s.Store.GetJob(jArgs.ID)
 		if err != nil {
-			sendMCPToolError(w, id, err.Error())
+			sendMCPToolError(w, id, mcpErrMsg(err))
 			return
 		}
 		if job == nil {
@@ -582,7 +585,7 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 			return
 		}
 		if err := s.Store.CancelJob(jArgs.ID); err != nil {
-			sendMCPToolError(w, id, err.Error())
+			sendMCPToolError(w, id, mcpErrMsg(err))
 			return
 		}
 		s.Hub.Notify("job", map[string]any{"id": jArgs.ID, "status": "failed", "log": "cancelled by user"})
@@ -597,7 +600,7 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 			return
 		}
 		if err := s.Store.DeleteJob(jArgs.ID); err != nil {
-			sendMCPToolError(w, id, err.Error())
+			sendMCPToolError(w, id, mcpErrMsg(err))
 			return
 		}
 		s.Hub.Notify("job", map[string]any{"id": jArgs.ID, "action": "deleted"})
@@ -615,7 +618,7 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 		}
 		jobsList, _, err := s.Store.ListJobs(filter.Status, filter.Limit, filter.Offset)
 		if err != nil {
-			sendMCPToolError(w, id, err.Error())
+			sendMCPToolError(w, id, mcpErrMsg(err))
 			return
 		}
 		b, _ := json.MarshalIndent(jobsList, "", "  ")
@@ -631,7 +634,7 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 		}
 		lib, err := s.Store.GetLibrary(sArgs.LibraryID)
 		if err != nil {
-			sendMCPToolError(w, id, err.Error())
+			sendMCPToolError(w, id, mcpErrMsg(err))
 			return
 		}
 		if lib == nil {
@@ -640,7 +643,7 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 		}
 		active, err := s.Store.IsScanActive(lib.ID)
 		if err != nil {
-			sendMCPToolError(w, id, err.Error())
+			sendMCPToolError(w, id, mcpErrMsg(err))
 			return
 		}
 		if active {
@@ -649,7 +652,7 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 		}
 		j, err := s.Store.CreateJob("scan_library", 0, lib.Path, jobs.ScanLibraryPayload{LibraryID: lib.ID})
 		if err != nil {
-			sendMCPToolError(w, id, err.Error())
+			sendMCPToolError(w, id, mcpErrMsg(err))
 			return
 		}
 		s.Runner.Wake()
@@ -659,7 +662,7 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 	case "queue_scan_all_job":
 		active, err := s.Store.IsScanAllActive()
 		if err != nil {
-			sendMCPToolError(w, id, err.Error())
+			sendMCPToolError(w, id, mcpErrMsg(err))
 			return
 		}
 		if active {
@@ -668,7 +671,7 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 		}
 		j, err := s.Store.CreateJob("scan_all", 0, "all libraries", map[string]any{})
 		if err != nil {
-			sendMCPToolError(w, id, err.Error())
+			sendMCPToolError(w, id, mcpErrMsg(err))
 			return
 		}
 		s.Runner.Wake()
@@ -678,6 +681,17 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 	default:
 		sendMCPToolError(w, id, "Unknown tool: "+toolName)
 	}
+}
+
+// mcpErrMsg keeps store, engine, and filesystem detail out of tool responses.
+// Messages authored here stay verbatim; anything else is logged and replaced.
+func mcpErrMsg(err error) string {
+	var ce *clientError
+	if errors.As(err, &ce) {
+		return ce.msg
+	}
+	fmt.Fprintf(os.Stderr, "mcp: %v\n", err)
+	return "the operation failed; see server logs for details"
 }
 
 func sendMCPResponse(w io.Writer, id *json.RawMessage, result any) {
@@ -743,13 +757,18 @@ func (s *Server) handleMCPSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	// Create and register session channel
-	ch := make(chan []byte, 100)
+	// Create and register session channel. The session context outlives any
+	// single POST but dies with this stream, which is what detached tool calls
+	// should be bound to.
+	sessCtx, sessCancel := context.WithCancel(context.WithoutCancel(r.Context()))
+	defer sessCancel()
+	sess := &mcpSession{ch: make(chan []byte, 100), ctx: sessCtx}
+	ch := sess.ch
 	s.mcpMu.Lock()
 	if s.mcpSessions == nil {
-		s.mcpSessions = map[string]chan []byte{}
+		s.mcpSessions = map[string]*mcpSession{}
 	}
-	s.mcpSessions[sessionID] = ch
+	s.mcpSessions[sessionID] = sess
 	s.mcpMu.Unlock()
 
 	defer func() {
@@ -783,12 +802,13 @@ func (s *Server) handleMCPMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mcpMu.Lock()
-	ch, ok := s.mcpSessions[sessionID]
+	sess, ok := s.mcpSessions[sessionID]
 	s.mcpMu.Unlock()
 	if !ok {
 		http.Error(w, "Session not found", http.StatusNotFound)
 		return
 	}
+	ch := sess.ch
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -809,7 +829,7 @@ func (s *Server) handleMCPMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	go func() {
-		s.handleMCPSSERequest(context.WithoutCancel(r.Context()), ch, &req)
+		s.handleMCPSSERequest(sess.ctx, ch, &req)
 	}()
 
 	w.WriteHeader(http.StatusOK)
@@ -834,6 +854,11 @@ func (s *Server) sendMCPSSEResponse(ch chan []byte, id *json.RawMessage, code in
 func (s *Server) handleMCPSSERequest(ctx context.Context, ch chan []byte, req *jsonRPCRequest) {
 	w := sseWriter{ch: ch}
 	s.handleMCPRequest(ctx, w, req)
+}
+
+type mcpSession struct {
+	ch  chan []byte
+	ctx context.Context
 }
 
 type sseWriter struct {

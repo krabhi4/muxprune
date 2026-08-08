@@ -367,6 +367,9 @@ func (s *Store) GetSidecar(id int64) (*Sidecar, error) {
 	return sc, err
 }
 
+// maxOffset caps deep pagination on both list endpoints.
+const maxOffset = 100000
+
 type FileFilter struct {
 	LibraryID int64
 	Query     string
@@ -424,6 +427,14 @@ func (s *Store) ListFiles(f FileFilter) ([]MediaFile, int, error) {
 	}
 	if f.Limit <= 0 || f.Limit > 500 {
 		f.Limit = 200
+	}
+	// A large OFFSET makes SQLite walk and discard every skipped row, so it is
+	// an expensive knob to leave in a caller's hands.
+	if f.Offset < 0 {
+		f.Offset = 0
+	}
+	if f.Offset > maxOffset {
+		f.Offset = maxOffset
 	}
 
 	// Dynamic sorting with whitelisting
@@ -690,6 +701,9 @@ func (s *Store) ListJobs(status string, limit, offset int) ([]Job, int, error) {
 	}
 	if offset < 0 {
 		offset = 0
+	}
+	if offset > maxOffset {
+		offset = maxOffset
 	}
 
 	countQuery := `SELECT count(*) FROM jobs`
