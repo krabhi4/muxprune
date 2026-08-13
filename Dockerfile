@@ -13,7 +13,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     -o /muxprune ./cmd/muxprune
 
 FROM alpine:3.24
-RUN apk add --no-cache ffmpeg mkvtoolnix tzdata su-exec
+RUN apk add --no-cache ffmpeg=8.1.2-r0 mkvtoolnix=99.0-r0 tzdata=2026c-r0 su-exec=0.3-r0
 COPY --from=build /muxprune /usr/local/bin/muxprune
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
@@ -25,7 +25,6 @@ ENV MUXPRUNE_CONFIG=/config \
 
 VOLUME /config
 EXPOSE 8484
-HEALTHCHECK --interval=30s --timeout=5s \
-    CMD wget -qO- http://127.0.0.1:${MUXPRUNE_PORT}/api/v1/health >/dev/null || exit 1
+HEALTHCHECK --interval=30s --timeout=5s CMD ["wget", "-qO-", "http://127.0.0.1:8484/api/v1/health"]
 
 ENTRYPOINT ["/entrypoint.sh"]
