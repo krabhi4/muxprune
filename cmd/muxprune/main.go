@@ -9,8 +9,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -87,7 +89,7 @@ func startMonitor(ctx context.Context, st *store.Store, runner *jobs.Runner, hub
 	enqueue := func(libID int64) {
 		enqMu.Lock()
 		defer enqMu.Unlock()
-		if active, _ := st.IsScanActive(libID); active {
+		if queued, _ := st.IsScanQueued(libID); queued {
 			return
 		}
 		lib, err := st.GetLibrary(libID)
@@ -105,6 +107,41 @@ func startMonitor(ctx context.Context, st *store.Store, runner *jobs.Runner, hub
 	wg.Add(1)
 	go func() { defer wg.Done(); m.Start(ctx) }()
 	return m
+}
+
+var errLocked = errors.New("lock held by another process")
+
+func startQueueOwner(ctx context.Context, configDir string, wg *sync.WaitGroup, run func()) {
+	lockPath := filepath.Join(configDir, "muxprune.lock")
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		waited := false
+		for {
+			f, err := lockFile(lockPath)
+			if err == nil {
+				defer f.Close()
+				if waited {
+					fmt.Fprintln(os.Stderr, "muxprune: acquired job queue lock; starting job runner")
+				}
+				run()
+				return
+			}
+			if !waited {
+				if errors.Is(err, errLocked) {
+					fmt.Fprintln(os.Stderr, "muxprune: another muxprune process owns the job queue; jobs queued here run there, retrying lock every 5s")
+				} else {
+					fmt.Fprintf(os.Stderr, "muxprune: cannot lock %s: %v; retrying every 5s\n", lockPath, err)
+				}
+				waited = true
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+			}
+		}
+	}()
 }
 
 func main() {
@@ -189,13 +226,14 @@ func runServe(args []string) error {
 
 	srv.StartJanitor(ctx)
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() { defer wg.Done(); runner.Start(ctx, *workers) }()
+	startQueueOwner(ctx, *configDir, &wg, func() {
+		if *recycleDays > 0 {
+			wg.Add(1)
+			go func() { defer wg.Done(); purgeLoop(ctx, eng, time.Duration(*recycleDays)*24*time.Hour) }()
+		}
+		runner.Start(ctx, *workers)
+	})
 	srv.Monitor = startMonitor(ctx, st, runner, hub, &wg)
-	if *recycleDays > 0 {
-		wg.Add(1)
-		go func() { defer wg.Done(); purgeLoop(ctx, eng, time.Duration(*recycleDays)*24*time.Hour) }()
-	}
 
 	bind := env("MUXPRUNE_BIND", "")
 	if bind == "" {
@@ -208,14 +246,17 @@ func runServe(args []string) error {
 	}
 
 	httpSrv := &http.Server{
-		Addr:              fmt.Sprintf("%s:%d", bind, *port),
+		Addr:              net.JoinHostPort(strings.Trim(bind, "[]"), strconv.Itoa(*port)),
 		Handler:           srv.Handler(),
+		BaseContext:       func(net.Listener) context.Context { return ctx },
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -229,6 +270,7 @@ func runServe(args []string) error {
 		*apiKey != "", webhookSecret != "", len(roots))
 	srvErr := httpSrv.ListenAndServe()
 	stop()
+	<-shutdownDone
 	wg.Wait()
 	if srvErr != nil && srvErr != http.ErrServerClosed {
 		return srvErr
@@ -266,6 +308,8 @@ func browseRoots() []string {
 }
 
 func runMCP(args []string) error {
+	stdout := os.Stdout
+	os.Stdout = os.Stderr
 	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
 	configDir := fs.String("config", env("MUXPRUNE_CONFIG", "./data"), "config/state directory")
 	workers := fs.Int("workers", envIntIn("MUXPRUNE_WORKERS", 1, 1, 64), "concurrent job workers")
@@ -306,15 +350,16 @@ func runMCP(args []string) error {
 
 	srv.StartJanitor(ctx)
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() { defer wg.Done(); runner.Start(ctx, *workers) }()
+	startQueueOwner(ctx, *configDir, &wg, func() {
+		if *recycleDays > 0 {
+			wg.Add(1)
+			go func() { defer wg.Done(); purgeLoop(ctx, eng, time.Duration(*recycleDays)*24*time.Hour) }()
+		}
+		runner.Start(ctx, *workers)
+	})
 	srv.Monitor = startMonitor(ctx, st, runner, hub, &wg)
-	if *recycleDays > 0 {
-		wg.Add(1)
-		go func() { defer wg.Done(); purgeLoop(ctx, eng, time.Duration(*recycleDays)*24*time.Hour) }()
-	}
 
-	err = srv.ServeMCP(ctx)
+	err = srv.ServeMCP(ctx, stdout)
 	stop()
 	wg.Wait()
 	return err

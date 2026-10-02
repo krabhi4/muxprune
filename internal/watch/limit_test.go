@@ -110,3 +110,29 @@ func TestWatcher_WatchCap_NotDegradedUnderCap(t *testing.T) {
 		t.Error("watcher should not be degraded for a small tree under the default cap")
 	}
 }
+
+func TestWatcher_ReAddDoesNotInflateCount(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < 2; i++ {
+		if err := os.Mkdir(filepath.Join(dir, "d"+strconv.Itoa(i)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := newLibWatcher(7, dir, 50*time.Millisecond, func(int64) {}, nil)
+	w.watchLimit = 3
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := w.start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer w.stop()
+	for i := 0; i < 5; i++ {
+		w.addRecursive(dir)
+	}
+	w.mu.Lock()
+	watches := w.watches
+	w.mu.Unlock()
+	if watches != 3 || w.isDegraded() {
+		t.Errorf("after re-adds watches = %d degraded = %v, want 3/false", watches, w.isDegraded())
+	}
+}

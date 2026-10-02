@@ -92,3 +92,72 @@ func TestMonitor_Reconcile_ConcurrentNoWatcherLeak(t *testing.T) {
 		t.Errorf("watcher goroutine leak: +%d goroutines after concurrent Reconcile (want <=1)", delta)
 	}
 }
+
+func TestMonitor_Reconcile_RestartsOnPathChange(t *testing.T) {
+	st := openReconcileStore(t)
+	lib := &store.Library{Name: "L", Path: t.TempDir(), Kind: "other", HardlinkPolicy: "skip", WatchEnabled: true}
+	if err := st.AddLibrary(lib); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	m := New(st, func(int64) {}, Config{Debounce: 50 * time.Millisecond})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.mu.Lock()
+	m.ctx = ctx
+	m.mu.Unlock()
+	m.Reconcile()
+
+	lib.Path = t.TempDir()
+	if err := st.UpdateLibrary(lib); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	m.Reconcile()
+
+	m.mu.Lock()
+	cur := m.watchers[lib.ID]
+	m.mu.Unlock()
+	if cur == nil || cur.root != lib.Path {
+		t.Fatalf("watcher not restarted on new path")
+	}
+}
+
+func TestMonitor_Reconcile_RebuildsWatcherThatLostRoot(t *testing.T) {
+	st := openReconcileStore(t)
+	dir := t.TempDir()
+	lib := &store.Library{Name: "L", Path: dir, Kind: "other", HardlinkPolicy: "skip", WatchEnabled: true}
+	if err := st.AddLibrary(lib); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	fired := make(chan int64, 4)
+	m := New(st, func(id int64) { fired <- id }, Config{Debounce: 50 * time.Millisecond})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.mu.Lock()
+	m.ctx = ctx
+	m.mu.Unlock()
+	m.Reconcile()
+
+	m.mu.Lock()
+	old := m.watchers[lib.ID]
+	m.mu.Unlock()
+	if old == nil {
+		t.Fatal("no watcher started")
+	}
+	if err := old.fsw.Remove(dir); err != nil {
+		t.Fatalf("remove root watch: %v", err)
+	}
+
+	m.Reconcile()
+
+	m.mu.Lock()
+	cur := m.watchers[lib.ID]
+	m.mu.Unlock()
+	if cur == nil || cur == old {
+		t.Fatal("watcher without its root watch was not rebuilt")
+	}
+	select {
+	case <-fired:
+	case <-time.After(3 * time.Second):
+		t.Error("rebuilt watcher did not schedule a catch-up scan")
+	}
+}

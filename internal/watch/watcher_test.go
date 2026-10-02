@@ -123,3 +123,90 @@ func openReconcileStore(t *testing.T) *store.Store {
 	t.Cleanup(func() { s.Close() })
 	return s
 }
+
+func TestWatcher_DirMovedOut_Triggers(t *testing.T) {
+	dir := t.TempDir()
+	show := filepath.Join(dir, "Show")
+	if err := os.MkdirAll(show, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fired := make(chan int64, 8)
+	w := newLibWatcher(3, dir, 80*time.Millisecond, func(id int64) { fired <- id }, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := w.start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	time.Sleep(120 * time.Millisecond)
+
+	if err := os.Rename(show, filepath.Join(t.TempDir(), "Show")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-fired:
+	case <-time.After(3 * time.Second):
+		t.Fatal("watcher did not fire when a directory was moved out")
+	}
+}
+
+func TestWatcher_MovedDirDropsStaleSubWatches(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "Show", "Season 01"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w := newLibWatcher(5, dir, 50*time.Millisecond, func(int64) {}, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := w.start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	time.Sleep(120 * time.Millisecond)
+	if err := os.Rename(filepath.Join(dir, "Show"), filepath.Join(dir, "Show (2020)")); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(dir, "Show", "Season 01")
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		found := false
+		for _, p := range w.fsw.WatchList() {
+			if p == stale {
+				found = true
+			}
+		}
+		if !found {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("stale watch %s still registered after its parent moved", stale)
+}
+
+func TestWatcher_RenamedDirStillWatched(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "a"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fired := make(chan int64, 16)
+	w := newLibWatcher(6, dir, 50*time.Millisecond, func(id int64) { fired <- id }, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := w.start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	time.Sleep(120 * time.Millisecond)
+	if err := os.Rename(filepath.Join(dir, "a"), filepath.Join(dir, "b")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	for len(fired) > 0 {
+		<-fired
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b", "new.mkv"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-fired:
+	case <-time.After(3 * time.Second):
+		t.Fatal("file created in a renamed directory did not trigger a scan")
+	}
+}

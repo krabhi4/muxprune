@@ -9,6 +9,13 @@ if [ "$#" -eq 0 ] || [ "${1#-}" != "$1" ]; then
     set -- serve "$@"
 fi
 
+if [ -n "$UMASK" ]; then
+    case "$UMASK" in
+        [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) umask "$UMASK" ;;
+        *) echo "muxprune: ignoring invalid UMASK=$UMASK (expected octal like 022)" >&2 ;;
+    esac
+fi
+
 if [ "$(id -u)" = "0" ]; then
     PUID="${PUID:-1000}"
     PGID="${PGID:-1000}"
@@ -18,14 +25,8 @@ if [ "$(id -u)" = "0" ]; then
     if ! getent passwd "$PUID" >/dev/null 2>&1; then
         adduser -D -H -u "$PUID" -G "$(getent group "$PGID" | cut -d: -f1)" muxprune
     fi
-    if [ -n "$UMASK" ]; then
-        case "$UMASK" in
-            [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) umask "$UMASK" ;;
-            *) echo "muxprune: ignoring invalid UMASK=$UMASK (expected octal like 022)" >&2 ;;
-        esac
-    fi
     mkdir -p "${MUXPRUNE_CONFIG:-/config}"
-    chown "$PUID:$PGID" "${MUXPRUNE_CONFIG:-/config}"
+    chown -R "$PUID:$PGID" "${MUXPRUNE_CONFIG:-/config}"
 
     # If the subcommand is a known muxprune command, run it under su-exec
     case "$1" in

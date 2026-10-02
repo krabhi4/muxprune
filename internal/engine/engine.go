@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,7 +19,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/krabhi4/muxprune/internal/probe"
@@ -48,11 +48,11 @@ type Result struct {
 }
 
 type MetadataEdit struct {
-	TrackIndex int    `json:"track_index"` // ffprobe stream index
-	Language   string `json:"language,omitempty"`
-	Title      string `json:"title,omitempty"`
-	Default    *bool  `json:"default,omitempty"`
-	Forced     *bool  `json:"forced,omitempty"`
+	TrackIndex int     `json:"track_index"` // ffprobe stream index
+	Language   string  `json:"language,omitempty"`
+	Title      *string `json:"title,omitempty"`
+	Default    *bool   `json:"default,omitempty"`
+	Forced     *bool   `json:"forced,omitempty"`
 }
 
 type Engine struct {
@@ -70,7 +70,7 @@ type Engine struct {
 	mkvmerge    string
 	mkvpropedit string
 
-	locks keyedMutex
+	locks KeyedMutex
 }
 
 func (e *Engine) resolve() {
@@ -87,9 +87,9 @@ func (e *Engine) HasMkvpropedit() bool { e.resolve(); return e.mkvpropedit != ""
 // EditMetadata performs in-place header edits on a Matroska file using
 // mkvpropedit. This is orders of magnitude faster than a full remux for
 // metadata-only changes (language, title, default/forced flags).
-func (e *Engine) EditMetadata(ctx context.Context, path string, edits []MetadataEdit) (*Result, error) {
+func (e *Engine) EditMetadata(ctx context.Context, path string, edits []MetadataEdit, allowHardlink bool) (*Result, error) {
 	e.resolve()
-	unlock := e.locks.lock(absKey(path))
+	unlock := e.locks.Lock(absKey(path))
 	defer unlock()
 	if e.mkvpropedit == "" {
 		return nil, errors.New("mkvpropedit not found in PATH")
@@ -105,6 +105,9 @@ func (e *Engine) EditMetadata(ctx context.Context, path string, edits []Metadata
 	if !res.IsMatroska() {
 		return nil, errors.New("mkvpropedit requires a Matroska file")
 	}
+	if _, err := statReplaceable(path, allowHardlink); err != nil {
+		return nil, err
+	}
 
 	// Build a lookup from ffprobe stream index to Stream.
 	byIdx := map[int]probe.Stream{}
@@ -112,7 +115,7 @@ func (e *Engine) EditMetadata(ctx context.Context, path string, edits []Metadata
 		byIdx[s.Index] = s
 	}
 
-	args := []string{path}
+	args := []string{probe.SafePathArg(path)}
 	for _, edit := range edits {
 		st, ok := byIdx[edit.TrackIndex]
 		if !ok {
@@ -121,30 +124,43 @@ func (e *Engine) EditMetadata(ctx context.Context, path string, edits []Metadata
 		if st.MkvID < 0 {
 			return nil, fmt.Errorf("stream index %d has no mkvmerge track ID (MkvID unknown)", edit.TrackIndex)
 		}
-		args = append(args, "--edit", "track:="+strconv.Itoa(st.MkvID))
+		var acts []string
 		if edit.Language != "" {
 			if !validLanguageTag(edit.Language) {
 				return nil, fmt.Errorf("invalid language tag %q", edit.Language)
 			}
-			args = append(args, "--set", "language="+edit.Language)
+			if edit.Language != st.Lang {
+				acts = append(acts, "--set", "language="+edit.Language)
+			}
 		}
-		if title := stripControl(edit.Title); title != "" {
-			args = append(args, "--set", "name="+title)
+		if edit.Title != nil {
+			if title := stripControl(*edit.Title); title != "" {
+				acts = append(acts, "--set", "name="+title)
+			} else {
+				acts = append(acts, "--delete", "name")
+			}
 		}
 		if edit.Default != nil {
-			args = append(args, "--set", "flag-default="+boolFlag(*edit.Default))
+			acts = append(acts, "--set", "flag-default="+boolFlag(*edit.Default))
 		}
 		if edit.Forced != nil {
-			args = append(args, "--set", "flag-forced="+boolFlag(*edit.Forced))
+			acts = append(acts, "--set", "flag-forced="+boolFlag(*edit.Forced))
 		}
+		if len(acts) > 0 {
+			args = append(append(args, "--edit", "track:"+strconv.Itoa(st.MkvID+1)), acts...)
+		}
+	}
+	if len(args) == 1 {
+		return &Result{Tool: "mkvpropedit", Command: "no changes"}, nil
 	}
 
 	cmdline := e.mkvpropedit + " " + strings.Join(args, " ")
 	tool, full := wrapNice(e.mkvpropedit, args)
-	cmd := exec.CommandContext(ctx, tool, full...)
+	editCtx := context.WithoutCancel(ctx)
+	cmd := exec.CommandContext(editCtx, tool, full...)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Run(); err != nil && !mkvWarningsOnly(editCtx, err) {
 		return nil, fmt.Errorf("mkvpropedit failed: %w: %s", err, tail(stderr.String(), 1000))
 	}
 	return &Result{Tool: "mkvpropedit", Command: cmdline, BytesSaved: 0}, nil
@@ -198,9 +214,9 @@ type MergeSpec struct {
 
 // ReorderTracks remuxes a Matroska file with tracks in the specified order
 // using mkvmerge's --track-order flag.
-func (e *Engine) ReorderTracks(ctx context.Context, path string, spec ReorderSpec) (*Result, error) {
+func (e *Engine) ReorderTracks(ctx context.Context, path string, spec ReorderSpec, allowHardlink bool) (*Result, error) {
 	e.resolve()
-	unlock := e.locks.lock(absKey(path))
+	unlock := e.locks.Lock(absKey(path))
 	defer unlock()
 	if e.mkvmerge == "" {
 		return nil, errors.New("mkvmerge not found in PATH")
@@ -209,6 +225,10 @@ func (e *Engine) ReorderTracks(ctx context.Context, path string, spec ReorderSpe
 		return nil, errors.New("no track order specified")
 	}
 
+	info, err := statReplaceable(path, allowHardlink)
+	if err != nil {
+		return nil, err
+	}
 	res, err := e.Prober.Probe(ctx, path)
 	if err != nil {
 		return nil, err
@@ -258,10 +278,6 @@ func (e *Engine) ReorderTracks(ctx context.Context, path string, spec ReorderSpe
 	}
 	trackOrder := strings.Join(orderParts, ",")
 
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, err
-	}
 	dir := filepath.Dir(path)
 	if free, err := freeSpace(dir); err == nil && free < uint64(info.Size()) {
 		return nil, fmt.Errorf("not enough free space in %s: need %d, have %d", dir, info.Size(), free)
@@ -269,7 +285,10 @@ func (e *Engine) ReorderTracks(ctx context.Context, path string, spec ReorderSpe
 
 	ext := filepath.Ext(path)
 	base := strings.TrimSuffix(filepath.Base(path), ext)
-	tmp := tempPath(dir, base, ext)
+	tmp, err := tempPath(dir, base, ext)
+	if err != nil {
+		return nil, err
+	}
 	defer os.Remove(tmp)
 
 	args := []string{"-q", "-o", tmp, "--track-order", trackOrder, probe.SafePathArg(path)}
@@ -278,7 +297,7 @@ func (e *Engine) ReorderTracks(ctx context.Context, path string, spec ReorderSpe
 	cmd := exec.CommandContext(ctx, tool, full...)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Run(); err != nil && !mkvWarningsOnly(ctx, err) {
 		return nil, fmt.Errorf("mkvmerge failed: %w: %s", err, tail(stderr.String(), 1000))
 	}
 
@@ -291,9 +310,8 @@ func (e *Engine) ReorderTracks(ctx context.Context, path string, spec ReorderSpe
 	if err != nil {
 		return nil, err
 	}
-	preserveAttrs(tmp, info)
-	if err := os.Rename(tmp, path); err != nil {
-		return nil, fmt.Errorf("atomic rename: %w", err)
+	if err := replaceOriginal(tmp, path, info); err != nil {
+		return nil, err
 	}
 	saved := info.Size() - outInfo.Size()
 	if saved < 0 {
@@ -307,9 +325,9 @@ func (e *Engine) ReorderTracks(ctx context.Context, path string, spec ReorderSpe
 
 // MergeTracks merges external subtitle/audio files into a Matroska container
 // using mkvmerge.
-func (e *Engine) MergeTracks(ctx context.Context, path string, spec MergeSpec) (*Result, error) {
+func (e *Engine) MergeTracks(ctx context.Context, path string, spec MergeSpec, allowHardlink bool) (*Result, error) {
 	e.resolve()
-	unlock := e.locks.lock(absKey(path))
+	unlock := e.locks.Lock(absKey(path))
 	defer unlock()
 	if e.mkvmerge == "" {
 		return nil, errors.New("mkvmerge not found in PATH")
@@ -318,6 +336,10 @@ func (e *Engine) MergeTracks(ctx context.Context, path string, spec MergeSpec) (
 		return nil, errors.New("no external files specified")
 	}
 
+	info, err := statReplaceable(path, allowHardlink)
+	if err != nil {
+		return nil, err
+	}
 	res, err := e.Prober.Probe(ctx, path)
 	if err != nil {
 		return nil, err
@@ -325,15 +347,16 @@ func (e *Engine) MergeTracks(ctx context.Context, path string, spec MergeSpec) (
 	if !res.IsMatroska() {
 		return nil, errors.New("track merging requires a Matroska file")
 	}
+	for _, s := range res.Streams {
+		if (s.Type == "video" || s.Type == "audio" || s.Type == "subtitle") && s.MkvID < 0 {
+			return nil, fmt.Errorf("stream %d is not visible to mkvmerge; merging would drop it", s.Index)
+		}
+	}
 
 	if err := e.ValidateExternalFiles(path, spec.ExternalFiles); err != nil {
 		return nil, err
 	}
 
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, err
-	}
 	dir := filepath.Dir(path)
 	if free, err := freeSpace(dir); err == nil && free < uint64(info.Size()) {
 		return nil, fmt.Errorf("not enough free space in %s: need %d, have %d", dir, info.Size(), free)
@@ -341,7 +364,10 @@ func (e *Engine) MergeTracks(ctx context.Context, path string, spec MergeSpec) (
 
 	ext := filepath.Ext(path)
 	base := strings.TrimSuffix(filepath.Base(path), ext)
-	tmp := tempPath(dir, base, ext)
+	tmp, err := tempPath(dir, base, ext)
+	if err != nil {
+		return nil, err
+	}
 	defer os.Remove(tmp)
 
 	args := []string{"-q", "-o", tmp, probe.SafePathArg(path)}
@@ -353,7 +379,7 @@ func (e *Engine) MergeTracks(ctx context.Context, path string, spec MergeSpec) (
 	cmd := exec.CommandContext(ctx, tool, full...)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Run(); err != nil && !mkvWarningsOnly(ctx, err) {
 		return nil, fmt.Errorf("mkvmerge failed: %w: %s", err, tail(stderr.String(), 1000))
 	}
 
@@ -366,9 +392,8 @@ func (e *Engine) MergeTracks(ctx context.Context, path string, spec MergeSpec) (
 	if err != nil {
 		return nil, err
 	}
-	preserveAttrs(tmp, info)
-	if err := os.Rename(tmp, path); err != nil {
-		return nil, fmt.Errorf("atomic rename: %w", err)
+	if err := replaceOriginal(tmp, path, info); err != nil {
+		return nil, err
 	}
 	saved := info.Size() - outInfo.Size()
 	if saved < 0 {
@@ -444,8 +469,9 @@ func resolveRoots(roots []string) []string {
 }
 
 func pathWithin(path string, roots []string) bool {
+	sep := string(filepath.Separator)
 	for _, root := range roots {
-		if path == root || strings.HasPrefix(path+string(filepath.Separator), root+string(filepath.Separator)) {
+		if path == root || strings.HasPrefix(path+sep, strings.TrimSuffix(root, sep)+sep) {
 			return true
 		}
 	}
@@ -490,10 +516,18 @@ func (e *Engine) verifyMerge(ctx context.Context, in *probe.Result, tmp string) 
 // RemoveTracks losslessly remuxes path without the specified streams.
 func (e *Engine) RemoveTracks(ctx context.Context, path string, spec RemovalSpec, opts Options) (*Result, error) {
 	e.resolve()
-	unlock := e.locks.lock(absKey(path))
-	defer unlock()
+	if !opts.DryRun {
+		unlock := e.locks.Lock(absKey(path))
+		defer unlock()
+	}
 	if spec.Empty() {
 		return nil, errors.New("nothing to remove")
+	}
+	spec.AudioIdx = slices.Compact(slices.Sorted(slices.Values(spec.AudioIdx)))
+	spec.SubIdx = slices.Compact(slices.Sorted(slices.Values(spec.SubIdx)))
+	info, err := statReplaceable(path, opts.AllowHardlink)
+	if err != nil {
+		return nil, err
 	}
 	res, err := e.Prober.Probe(ctx, path)
 	if err != nil {
@@ -503,15 +537,6 @@ func (e *Engine) RemoveTracks(ctx context.Context, path string, spec RemovalSpec
 		return nil, err
 	}
 
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, err
-	}
-	if !opts.AllowHardlink {
-		if n := nlink(info); n > 1 {
-			return nil, fmt.Errorf("%w: file has %d hardlinks (likely still seeding); enable hardlink override to proceed", ErrSkipped, n)
-		}
-	}
 	dir := filepath.Dir(path)
 	if free, err := freeSpace(dir); err == nil && free < uint64(info.Size()) {
 		return nil, fmt.Errorf("not enough free space in %s: need %d, have %d", dir, info.Size(), free)
@@ -523,7 +548,6 @@ func (e *Engine) RemoveTracks(ctx context.Context, path string, spec RemovalSpec
 	}
 	ext := filepath.Ext(path)
 	base := strings.TrimSuffix(filepath.Base(path), ext)
-	tmp := tempPath(dir, base, ext)
 	cmdline := tool + " " + strings.Join(args, " ")
 
 	if opts.DryRun {
@@ -531,14 +555,18 @@ func (e *Engine) RemoveTracks(ctx context.Context, path string, spec RemovalSpec
 			BytesSaved: estimateRemoved(res, spec)}, nil
 	}
 
+	tmp, err := tempPath(dir, base, ext)
+	if err != nil {
+		return nil, err
+	}
 	defer os.Remove(tmp) // no-op after successful rename
 	full := append(slices.Clone(args), outputArgs(tool, tmp)...)
 	full = reorderOutput(tool, full, tmp)
-	tool, full = wrapNice(tool, full)
-	cmd := exec.CommandContext(ctx, tool, full...)
+	bin, full := wrapNice(tool, full)
+	cmd := exec.CommandContext(ctx, bin, full...)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Run(); err != nil && !(tool == e.mkvmerge && mkvWarningsOnly(ctx, err)) {
 		return nil, fmt.Errorf("%s failed: %w: %s", filepath.Base(tool), err, tail(stderr.String(), 1000))
 	}
 
@@ -550,14 +578,57 @@ func (e *Engine) RemoveTracks(ctx context.Context, path string, spec RemovalSpec
 	if err != nil {
 		return nil, err
 	}
-	preserveAttrs(tmp, info)
-	if err := os.Rename(tmp, path); err != nil {
-		return nil, fmt.Errorf("atomic rename: %w", err)
+	if err := replaceOriginal(tmp, path, info); err != nil {
+		return nil, err
 	}
 	return &Result{
 		Tool: filepath.Base(tool), Command: cmdline,
 		BytesSaved: info.Size() - outInfo.Size(),
 	}, nil
+}
+
+func checkHardlinks(info fs.FileInfo, allow bool) error {
+	if n := nlink(info); n > 1 && !allow {
+		return fmt.Errorf("%w: file has %d hardlinks (likely still seeding); enable hardlink override to proceed", ErrSkipped, n)
+	}
+	return nil
+}
+
+func statReplaceable(path string, allowHardlink bool) (fs.FileInfo, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&fs.ModeSymlink != 0 {
+		return nil, fmt.Errorf("%w: %s is a symlink; point the library at the real file instead", ErrSkipped, path)
+	}
+	return info, checkHardlinks(info, allowHardlink)
+}
+
+func replaceOriginal(tmp, path string, orig fs.FileInfo) error {
+	f, err := os.OpenFile(tmp, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return fmt.Errorf("sync temp file: %w", err)
+	}
+	preserveAttrs(tmp, orig)
+	if cur, err := os.Lstat(path); err != nil || !os.SameFile(cur, orig) || cur.Size() != orig.Size() || !cur.ModTime().Equal(orig.ModTime()) {
+		return fmt.Errorf("%s changed during processing; leaving it untouched", path)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("atomic rename: %w", err)
+	}
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
+		d.Sync()
+		d.Close()
+	}
+	return nil
 }
 
 func validate(res *probe.Result, spec RemovalSpec, opts Options) error {
@@ -638,7 +709,7 @@ func mkvmergeArgs(res *probe.Result, spec RemovalSpec) []string {
 }
 
 func ffmpegArgs(res *probe.Result, spec RemovalSpec) []string {
-	args := []string{"-y", "-v", "error", "-i", res.Path, "-map", "0"}
+	args := []string{"-y", "-v", "error", "-i", probe.SafePathArg(res.Path), "-map", "0"}
 	// ffmpeg negative maps use per-type positions, not global indexes.
 	pos := func(typ string, idx int) int {
 		p := 0
@@ -718,7 +789,11 @@ func (e *Engine) verify(ctx context.Context, in *probe.Result, spec RemovalSpec,
 			return fmt.Errorf("duration drifted: %.2fs -> %.2fs (tolerance %.2fs)", in.Duration, out.Duration, tolerance)
 		}
 	}
-	floor := sizeFloor(in.Size, estimateRemoved(in, spec))
+	est := estimateRemoved(in, spec)
+	if !removedBitratesKnown(in, spec) {
+		est = in.Size
+	}
+	floor := sizeFloor(in.Size, est)
 	if out.Size < floor {
 		return fmt.Errorf("output suspiciously small: %d < floor %d (input %d)", out.Size, floor, in.Size)
 	}
@@ -731,6 +806,16 @@ func sizeFloor(inSize, estRemoved int64) int64 {
 		floor = minFloor
 	}
 	return floor
+}
+
+func removedBitratesKnown(res *probe.Result, spec RemovalSpec) bool {
+	removed := append(slices.Clone(spec.AudioIdx), spec.SubIdx...)
+	for _, s := range res.Streams {
+		if slices.Contains(removed, s.Index) && (s.BitRate <= 0 || res.Duration <= 0) {
+			return false
+		}
+	}
+	return true
 }
 
 func estimateRemoved(res *probe.Result, spec RemovalSpec) int64 {
@@ -762,9 +847,12 @@ func (e *Engine) DeleteSidecar(path string, dryRun bool) (*Result, error) {
 		if err := os.MkdirAll(e.RecycleDir, 0o755); err != nil {
 			return nil, err
 		}
+		recycleMu.Lock()
 		dst := uniqueDst(e.RecycleDir,
-			time.Now().UTC().Format("20060102-150405")+"_"+filepath.Base(path))
-		if err := moveFile(path, dst); err != nil {
+			time.Now().UTC().Format(recycleStamp)+"_"+filepath.Base(path))
+		err := moveFile(path, dst)
+		recycleMu.Unlock()
+		if err != nil {
 			return nil, err
 		}
 		r.Command = "recycle " + path + " -> " + dst
@@ -796,7 +884,13 @@ func (e *Engine) PurgeRecycle(olderThan time.Duration) (int, error) {
 		if err != nil || info.IsDir() {
 			continue
 		}
-		if info.ModTime().Before(cutoff) {
+		age := info.ModTime()
+		if len(ent.Name()) > len(recycleStamp) {
+			if t, err := time.Parse(recycleStamp, ent.Name()[:len(recycleStamp)]); err == nil {
+				age = t
+			}
+		}
+		if age.Before(cutoff) {
 			if os.Remove(filepath.Join(e.RecycleDir, ent.Name())) == nil {
 				n++
 			}
@@ -814,12 +908,15 @@ func isSubtitlePath(path string) bool {
 	return subtitleExts[strings.ToLower(filepath.Ext(path))]
 }
 
+const recycleStamp = "20060102-150405"
+
 func uniqueDst(dir, name string) string {
-	dst := filepath.Join(dir, name)
 	ext := filepath.Ext(name)
 	stem := strings.TrimSuffix(name, ext)
+	stem = truncateBytes(stem, 200-len(ext))
+	dst := filepath.Join(dir, stem+ext)
 	for i := 1; ; i++ {
-		if _, err := os.Stat(dst); os.IsNotExist(err) {
+		if _, err := os.Stat(dst); err != nil {
 			return dst
 		}
 		dst = filepath.Join(dir, fmt.Sprintf("%s_%d%s", stem, i, ext))
@@ -845,6 +942,11 @@ func moveFile(src, dst string) error {
 		os.Remove(tmp)
 		return err
 	}
+	if err := out.Sync(); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return err
+	}
 	if err := out.Close(); err != nil {
 		os.Remove(tmp)
 		return err
@@ -856,11 +958,26 @@ func moveFile(src, dst string) error {
 	return os.Remove(src)
 }
 
-var tmpSeq atomic.Int64
+var recycleMu sync.Mutex
 
-func tempPath(dir, base, ext string) string {
-	n := tmpSeq.Add(1)
-	return filepath.Join(dir, fmt.Sprintf(".%s.muxprune.tmp.%d-%d%s", base, os.Getpid(), n, ext))
+func truncateBytes(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return strings.ToValidUTF8(s[:max], "")
+}
+
+func tempPath(dir, base, ext string) (string, error) {
+	f, err := os.CreateTemp(dir, "."+truncateBytes(base, 200)+".muxprune.tmp.*"+ext)
+	if err != nil {
+		return "", err
+	}
+	return f.Name(), f.Close()
+}
+
+func mkvWarningsOnly(ctx context.Context, err error) bool {
+	var ee *exec.ExitError
+	return ctx.Err() == nil && errors.As(err, &ee) && ee.ExitCode() == 1
 }
 
 func absKey(path string) string {
@@ -870,7 +987,7 @@ func absKey(path string) string {
 	return path
 }
 
-type keyedMutex struct {
+type KeyedMutex struct {
 	mu sync.Mutex
 	m  map[string]*refMutex
 }
@@ -880,7 +997,7 @@ type refMutex struct {
 	refs int
 }
 
-func (k *keyedMutex) lock(key string) func() {
+func (k *KeyedMutex) Lock(key string) func() {
 	k.mu.Lock()
 	if k.m == nil {
 		k.m = make(map[string]*refMutex)

@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/krabhi4/muxprune/internal/engine"
+	"github.com/krabhi4/muxprune/internal/jobs"
 	"github.com/krabhi4/muxprune/internal/probe"
 	"github.com/krabhi4/muxprune/internal/scan"
 	"github.com/krabhi4/muxprune/internal/store"
@@ -179,6 +180,17 @@ func TestAuth_WebhookSecret(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("wrong webhook secret: status = %d, want 401", rec.Code)
 	}
+
+	for i := 0; i < authFailLimit; i++ {
+		req = httptest.NewRequest("POST", "/api/v1/webhooks/arr", bytes.NewBufferString(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Webhook-Secret", "wrong")
+		rec = httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+	}
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("repeated wrong webhook secrets: status = %d, want 429", rec.Code)
+	}
 }
 
 func TestHandleBrowse_JailRejectsOutsideRoot(t *testing.T) {
@@ -315,6 +327,7 @@ func TestOversizedBodyRejected413(t *testing.T) {
 	_, h := newTestServer(t)
 	body := `{"file_ids":[` + strings.Repeat("1,", 6<<20) + `1]}`
 	req := httptest.NewRequest("POST", "/api/v1/batch", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 	if w.Code != 413 {
@@ -413,5 +426,70 @@ func TestHandleAddLibrary_JailedToBrowseRoots(t *testing.T) {
 	rec = doJSON(t, h, "POST", "/api/v1/libraries", `{"path":"`+inside+`"}`)
 	if rec.Code != 201 {
 		t.Errorf("library inside roots = %d body=%s, want 201", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleCancelJob_RunningInAnotherProcess(t *testing.T) {
+	s, h := newTestServer(t)
+	s.Runner = &jobs.Runner{}
+	j, err := s.Store.CreateJob("remux", 0, "/x.mkv", map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Store.ClaimNextJob(); err != nil {
+		t.Fatal(err)
+	}
+	rec := doJSON(t, h, "POST", "/api/v1/jobs/"+strconv.FormatInt(j.ID, 10)+"/cancel", "")
+	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "another muxprune process") {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleUpdateLibrary_KeepsSymlinkedPath(t *testing.T) {
+	s, h := newTestServer(t)
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skip(err)
+	}
+	lib := &store.Library{Name: "X", Path: link, Kind: "tv", HardlinkPolicy: "skip"}
+	if err := s.Store.AddLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	rec := doJSON(t, h, "PUT", "/api/v1/libraries/"+strconv.FormatInt(lib.ID, 10),
+		`{"path":"`+link+`","name":"Renamed","kind":"tv"}`)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if got, _ := s.Store.GetLibrary(lib.ID); got.Path != link {
+		t.Errorf("path = %q, want %q", got.Path, link)
+	}
+}
+
+func TestHandleUpdateLibrary_PathChangeQueuesScan(t *testing.T) {
+	s, h := newTestServer(t)
+	s.Runner = &jobs.Runner{Store: s.Store}
+	oldDir, newDir := t.TempDir(), t.TempDir()
+	lib := &store.Library{Name: "X", Path: oldDir, Kind: "tv", HardlinkPolicy: "skip"}
+	if err := s.Store.AddLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	rec := doJSON(t, h, "PUT", "/api/v1/libraries/"+strconv.FormatInt(lib.ID, 10),
+		`{"path":"`+newDir+`","name":"X","kind":"tv"}`)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if q, _ := s.Store.IsScanQueued(lib.ID); !q {
+		t.Error("changing a library's path did not queue a rescan")
+	}
+}
+
+func TestMCP_PingReturnsEmptyResult(t *testing.T) {
+	s, _ := newTestServer(t)
+	id := json.RawMessage(`7`)
+	var out bytes.Buffer
+	s.handleMCPRequest(context.Background(), &out, &jsonRPCRequest{JSONRPC: "2.0", ID: &id, Method: "ping"})
+	if !strings.Contains(out.String(), `"result":{}`) || strings.Contains(out.String(), `"error"`) {
+		t.Errorf("ping reply = %s, want an empty result", out.String())
 	}
 }

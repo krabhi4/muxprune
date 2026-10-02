@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -29,15 +30,18 @@ type SidecarPayload struct {
 }
 
 type EditMetadataPayload struct {
-	Edits []engine.MetadataEdit `json:"edits"`
+	Edits         []engine.MetadataEdit `json:"edits"`
+	AllowHardlink bool                  `json:"allow_hardlink"`
 }
 
 type ReorderPayload struct {
-	TrackOrder []int `json:"track_order"`
+	TrackOrder    []int `json:"track_order"`
+	AllowHardlink bool  `json:"allow_hardlink"`
 }
 
 type MergePayload struct {
 	ExternalFiles []string `json:"external_files"`
+	AllowHardlink bool     `json:"allow_hardlink"`
 }
 
 type ScanLibraryPayload struct {
@@ -57,6 +61,8 @@ type Runner struct {
 	cmu       sync.Mutex
 	cancels   map[int64]context.CancelFunc
 	cancelled map[int64]bool
+
+	locks engine.KeyedMutex
 }
 
 func (r *Runner) grace() time.Duration {
@@ -67,7 +73,7 @@ func (r *Runner) grace() time.Duration {
 }
 
 func finalStatus(wasCancelled, killed bool, status, log string) (string, string) {
-	if wasCancelled {
+	if wasCancelled && status != "done" {
 		return "cancelled", "cancelled by user"
 	}
 	if killed && status == "failed" {
@@ -201,7 +207,33 @@ func clampLog(s string) string {
 	return s[:maxJobLog] + " ...[truncated]"
 }
 
+func staleFingerprint(job *store.Job) string {
+	if !job.FileSize.Valid || !job.FileMtime.Valid {
+		return ""
+	}
+	info, err := os.Stat(job.FilePath)
+	if err != nil {
+		return err.Error()
+	}
+	if info.Size() != job.FileSize.Int64 || info.ModTime().Unix() != job.FileMtime.Int64 {
+		return "file changed since this job was queued; re-select tracks"
+	}
+	return ""
+}
+
+func (r *Runner) allowHardlink(job *store.Job, requested bool) bool {
+	return requested || r.Store.HardlinkPolicyProceeds(job.MediaFileID())
+}
+
 func (r *Runner) execute(ctx context.Context, job *store.Job) (status, log string, saved int64) {
+	switch job.Type {
+	case "remux", "edit_metadata", "reorder_tracks", "merge_tracks":
+		unlock := r.locks.Lock(job.FilePath)
+		defer unlock()
+		if msg := staleFingerprint(job); msg != "" {
+			return "failed", msg, 0
+		}
+	}
 	switch job.Type {
 	case "remux":
 		var p RemuxPayload
@@ -210,14 +242,14 @@ func (r *Runner) execute(ctx context.Context, job *store.Job) (status, log strin
 		}
 		res, err := r.Engine.RemoveTracks(ctx, job.FilePath,
 			engine.RemovalSpec{AudioIdx: p.AudioIdx, SubIdx: p.SubIdx},
-			engine.Options{AllowHardlink: p.AllowHardlink, AllowLastAudio: p.AllowLastAudio})
+			engine.Options{AllowHardlink: r.allowHardlink(job, p.AllowHardlink), AllowLastAudio: p.AllowLastAudio})
 		if err != nil {
 			if errors.Is(err, engine.ErrSkipped) {
 				return "skipped", err.Error(), 0
 			}
 			return "failed", err.Error(), 0
 		}
-		r.refreshFile(ctx, job.MediaFileID())
+		r.refreshFile(context.WithoutCancel(ctx), job.MediaFileID())
 		return "done", res.Tool + ": " + res.Command, res.BytesSaved
 
 	case "delete_sidecar":
@@ -236,7 +268,7 @@ func (r *Runner) execute(ctx context.Context, job *store.Job) (status, log strin
 				warn = " | warning: sidecar db row not removed: " + err.Error()
 			}
 		}
-		r.refreshFile(ctx, job.MediaFileID())
+		r.refreshFile(context.WithoutCancel(ctx), job.MediaFileID())
 		return "done", res.Command + warn, res.BytesSaved
 
 	case "edit_metadata":
@@ -244,11 +276,14 @@ func (r *Runner) execute(ctx context.Context, job *store.Job) (status, log strin
 		if err := json.Unmarshal(job.Payload, &p); err != nil {
 			return "failed", "bad payload: " + err.Error(), 0
 		}
-		res, err := r.Engine.EditMetadata(ctx, job.FilePath, p.Edits)
+		res, err := r.Engine.EditMetadata(ctx, job.FilePath, p.Edits, p.AllowHardlink)
 		if err != nil {
+			if errors.Is(err, engine.ErrSkipped) {
+				return "skipped", err.Error(), 0
+			}
 			return "failed", err.Error(), 0
 		}
-		r.refreshFile(ctx, job.MediaFileID())
+		r.refreshFile(context.WithoutCancel(ctx), job.MediaFileID())
 		return "done", res.Tool + ": " + res.Command, res.BytesSaved
 
 	case "reorder_tracks":
@@ -256,11 +291,14 @@ func (r *Runner) execute(ctx context.Context, job *store.Job) (status, log strin
 		if err := json.Unmarshal(job.Payload, &p); err != nil {
 			return "failed", "bad payload: " + err.Error(), 0
 		}
-		res, err := r.Engine.ReorderTracks(ctx, job.FilePath, engine.ReorderSpec{TrackOrder: p.TrackOrder})
+		res, err := r.Engine.ReorderTracks(ctx, job.FilePath, engine.ReorderSpec{TrackOrder: p.TrackOrder}, r.allowHardlink(job, p.AllowHardlink))
 		if err != nil {
+			if errors.Is(err, engine.ErrSkipped) {
+				return "skipped", err.Error(), 0
+			}
 			return "failed", err.Error(), 0
 		}
-		r.refreshFile(ctx, job.MediaFileID())
+		r.refreshFile(context.WithoutCancel(ctx), job.MediaFileID())
 		return "done", res.Tool + ": " + res.Command, res.BytesSaved
 
 	case "merge_tracks":
@@ -268,11 +306,14 @@ func (r *Runner) execute(ctx context.Context, job *store.Job) (status, log strin
 		if err := json.Unmarshal(job.Payload, &p); err != nil {
 			return "failed", "bad payload: " + err.Error(), 0
 		}
-		res, err := r.Engine.MergeTracks(ctx, job.FilePath, engine.MergeSpec{ExternalFiles: p.ExternalFiles})
+		res, err := r.Engine.MergeTracks(ctx, job.FilePath, engine.MergeSpec{ExternalFiles: p.ExternalFiles}, r.allowHardlink(job, p.AllowHardlink))
 		if err != nil {
+			if errors.Is(err, engine.ErrSkipped) {
+				return "skipped", err.Error(), 0
+			}
 			return "failed", err.Error(), 0
 		}
-		r.refreshFile(ctx, job.MediaFileID())
+		r.refreshFile(context.WithoutCancel(ctx), job.MediaFileID())
 		return "done", res.Tool + ": " + res.Command, res.BytesSaved
 
 	case "scan_library":

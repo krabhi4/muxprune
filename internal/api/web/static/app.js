@@ -345,6 +345,8 @@ $("#btn-browse-path").addEventListener("click", () => {
   $("#dlg-browse").showModal();
 });
 
+$$('dialog button[value="cancel"]').forEach((b) => b.addEventListener("click", () => b.closest("dialog").close()));
+
 $("#btn-browse-cancel").addEventListener("click", () => {
   $("#dlg-browse").close();
 });
@@ -818,12 +820,13 @@ async function openFileDialog(id) {
 
 function fileDialogRequest(dry) {
   const remove_audio = [], remove_subs = [], delete_sidecars = [];
-  $$('#dlg-streams input:checked').forEach((c) =>
+  $$('#dlg-streams input[data-type]:checked').forEach((c) =>
     (c.dataset.type === "audio" ? remove_audio : remove_subs).push(+c.dataset.idx));
   $$('#dlg-sidecars input:checked').forEach((c) => delete_sidecars.push(+c.dataset.sidecar));
   return {
     remove_audio, remove_subs, delete_sidecars,
     allow_hardlink: $("#dlg-allow-hardlink").checked, dry_run: dry,
+    expect_size: dlgFile.size, expect_mtime: dlgFile.mtime,
   };
 }
 
@@ -861,7 +864,7 @@ $("#dlg-save-order").addEventListener("click", async () => {
   try {
     await api(`/files/${dlgFile.id}/reorder`, {
       method: "POST",
-      body: { track_order }
+      body: { track_order, allow_hardlink: $("#dlg-allow-hardlink").checked, expect_size: dlgFile.size, expect_mtime: dlgFile.mtime }
     });
     toast("Queued track reordering job");
     $("#dlg-file").close();
@@ -881,7 +884,7 @@ $("#dlg-save-metadata").addEventListener("click", async () => {
   try {
     await api(`/files/${dlgFile.id}/metadata`, {
       method: "POST",
-      body: { edits }
+      body: { edits, expect_size: dlgFile.size, expect_mtime: dlgFile.mtime }
     });
     toast("Queued header edit job");
     $("#dlg-file").close();
@@ -894,7 +897,7 @@ $("#dlg-merge-btn").addEventListener("click", async () => {
   try {
     await api(`/files/${dlgFile.id}/merge`, {
       method: "POST",
-      body: { external_files: [path] }
+      body: { external_files: [path], allow_hardlink: $("#dlg-allow-hardlink").checked, expect_size: dlgFile.size, expect_mtime: dlgFile.mtime }
     });
     toast("Queued track merge job");
     $("#dlg-file").close();
@@ -1047,6 +1050,12 @@ $("#btn-jobs-next").addEventListener("click", () => {
 });
 
 // ---- live events ----
+const debounceTimers = new Map();
+function debounced(fn, ms = 500) {
+  clearTimeout(debounceTimers.get(fn));
+  debounceTimers.set(fn, setTimeout(() => { debounceTimers.delete(fn); fn(); }, ms));
+}
+
 function connectEvents() {
   const es = new EventSource("/api/v1/events");
   es.addEventListener("scan", (e) => {
@@ -1067,13 +1076,13 @@ function connectEvents() {
   });
   es.addEventListener("job", (e) => {
     const d = JSON.parse(e.data);
-    if (currentView() === "jobs") loadJobs();
+    if (currentView() === "jobs") debounced(loadJobs);
     if (d.status && d.status !== "running" && d.status !== "queued") {
       if (d.type === "scan_library" || d.type === "scan_all") $("#scan-progress").hidden = true;
       toast(`Job #${d.id} ${d.status}${d.bytes_saved ? " · saved " + human(d.bytes_saved) : ""}`,
         d.status === "failed");
-      if (currentView() === "files") loadFiles();
-      loadStats();
+      if (currentView() === "files") debounced(loadFiles);
+      debounced(loadStats);
     }
   });
   es.onerror = () => { es.close(); setTimeout(connectEvents, 5000); };

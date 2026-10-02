@@ -27,10 +27,13 @@ func freeSpace(dir string) (uint64, error) {
 
 // preserveAttrs copies mode and ownership from the original onto the
 // temp file before the rename, so the replacement is invisible to PUID/PGID
-// based setups. Chown failures (non-root) are ignored.
+// based setups. When a full chown fails (non-root), only the group is set;
+// remaining failures are ignored.
 func preserveAttrs(tmp string, orig fs.FileInfo) {
 	os.Chmod(tmp, orig.Mode().Perm())
 	if st, ok := orig.Sys().(*syscall.Stat_t); ok {
-		os.Chown(tmp, int(st.Uid), int(st.Gid))
+		if os.Chown(tmp, int(st.Uid), int(st.Gid)) != nil {
+			os.Chown(tmp, -1, int(st.Gid))
+		}
 	}
 }

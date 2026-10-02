@@ -84,8 +84,9 @@ type ffprobeOut struct {
 		ChannelLayout string `json:"channel_layout"`
 		BitRate       string `json:"bit_rate"`
 		Disposition   struct {
-			Default int `json:"default"`
-			Forced  int `json:"forced"`
+			Default     int `json:"default"`
+			Forced      int `json:"forced"`
+			AttachedPic int `json:"attached_pic"`
 		} `json:"disposition"`
 		Tags map[string]string `json:"tags"`
 	} `json:"streams"`
@@ -144,6 +145,9 @@ func ParseFFprobe(data []byte, path string) (*Result, error) {
 			Lang:          s.Tags["language"],
 			Title:         s.Tags["title"],
 		}
+		if s.Disposition.AttachedPic == 1 {
+			st.Type = "attachment"
+		}
 		if st.Lang == "" {
 			st.Lang = s.Tags["LANGUAGE"]
 		}
@@ -153,6 +157,8 @@ func ParseFFprobe(data []byte, path string) (*Result, error) {
 		if br, err := strconv.ParseInt(s.BitRate, 10, 64); err == nil {
 			st.BitRate = br
 		} else if bps, err := strconv.ParseInt(s.Tags["BPS"], 10, 64); err == nil {
+			st.BitRate = bps
+		} else if bps, err := strconv.ParseInt(s.Tags["BPS-eng"], 10, 64); err == nil {
 			st.BitRate = bps
 		}
 		res.Streams = append(res.Streams, st)
@@ -265,7 +271,7 @@ var mkvCodecNames = map[string]string{
 	"A_MPEG/L3":        "mp3",
 	"S_TEXT/UTF8":      "subrip",
 	"S_TEXT/ASS":       "ass",
-	"S_TEXT/SSA":       "ssa",
+	"S_TEXT/SSA":       "ass",
 	"S_TEXT/WEBVTT":    "webvtt",
 	"S_HDMV/PGS":       "hdmv_pgs_subtitle",
 	"S_VOBSUB":         "dvd_subtitle",

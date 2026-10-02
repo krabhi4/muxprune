@@ -2,15 +2,18 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/krabhi4/muxprune/internal/probe"
 )
@@ -99,18 +102,28 @@ func TestVerifyRejectsCorruptOutput(t *testing.T) {
 }
 
 func TestTempPathUniqueAndSkippable(t *testing.T) {
-	a := tempPath("/d", "movie", ".mkv")
-	b := tempPath("/d", "movie", ".mkv")
+	dir := t.TempDir()
+	a, err := tempPath(dir, "movie", ".mkv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := tempPath(dir, "movie", ".mkv")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if a == b {
 		t.Fatalf("temp paths must be unique, both = %s", a)
 	}
-	if !strings.Contains(a, ".muxprune.tmp") {
-		t.Errorf("temp path missing scanner-skip marker: %s", a)
+	if name := filepath.Base(a); !strings.HasPrefix(name, ".movie.muxprune.tmp.") || !strings.HasSuffix(name, ".mkv") {
+		t.Errorf("temp name must keep the scanner-skip marker and extension: %s", name)
+	}
+	if fi, err := os.Lstat(a); err != nil || !fi.Mode().IsRegular() {
+		t.Errorf("temp file must be created as a regular file: %v", err)
 	}
 }
 
 func TestKeyedMutexSerializesSameKey(t *testing.T) {
-	var km keyedMutex
+	var km KeyedMutex
 	var mu sync.Mutex
 	var active, maxActive int
 	var wg sync.WaitGroup
@@ -118,7 +131,7 @@ func TestKeyedMutexSerializesSameKey(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			unlock := km.lock("same/file.mkv")
+			unlock := km.Lock("same/file.mkv")
 			defer unlock()
 			mu.Lock()
 			active++
@@ -134,17 +147,17 @@ func TestKeyedMutexSerializesSameKey(t *testing.T) {
 	}
 	wg.Wait()
 	if maxActive != 1 {
-		t.Fatalf("keyedMutex allowed %d concurrent holders for the same key, want 1", maxActive)
+		t.Fatalf("KeyedMutex allowed %d concurrent holders for the same key, want 1", maxActive)
 	}
 }
 
 func TestKeyedMutexAllowsDifferentKeys(t *testing.T) {
-	var km keyedMutex
-	unlockA := km.lock("a")
+	var km KeyedMutex
+	unlockA := km.Lock("a")
 	defer unlockA()
 	done := make(chan struct{})
 	go func() {
-		unlockB := km.lock("b")
+		unlockB := km.Lock("b")
 		unlockB()
 		close(done)
 	}()
@@ -441,6 +454,8 @@ func TestDeleteSidecarRecycle(t *testing.T) {
 	dir := t.TempDir()
 	sub := filepath.Join(dir, "movie.en.srt")
 	os.WriteFile(sub, []byte("1\n00:00:00,000 --> 00:00:01,000\nx\n"), 0o644)
+	old := time.Now().Add(-30 * 24 * time.Hour)
+	os.Chtimes(sub, old, old)
 	recycle := filepath.Join(dir, "recycle")
 	e := &Engine{RecycleDir: recycle}
 
@@ -453,6 +468,9 @@ func TestDeleteSidecarRecycle(t *testing.T) {
 	entries, _ := os.ReadDir(recycle)
 	if len(entries) != 1 {
 		t.Fatalf("expected 1 recycled file, got %d", len(entries))
+	}
+	if n, _ := e.PurgeRecycle(time.Hour); n != 0 {
+		t.Errorf("freshly recycled file purged by age: %d removed", n)
 	}
 	// Refuse non-subtitle paths.
 	video := filepath.Join(dir, "movie.mkv")
@@ -490,7 +508,7 @@ func TestReorderTracks(t *testing.T) {
 	// Let's reorder the audio streams: fre (3), jpn (2), eng (1).
 	// Track order should contain all streams in new order.
 	order := []int{0, 3, 2, 1, 4, 5}
-	res, err := e.ReorderTracks(ctx, path, ReorderSpec{TrackOrder: order})
+	res, err := e.ReorderTracks(ctx, path, ReorderSpec{TrackOrder: order}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -528,7 +546,7 @@ func TestMergeTracks(t *testing.T) {
 	srtContent := "1\n00:00:00,000 --> 00:00:02,000\nexternal\n"
 	os.WriteFile(extSub, []byte(srtContent), 0o644)
 
-	res, err := e.MergeTracks(ctx, path, MergeSpec{ExternalFiles: []string{extSub}})
+	res, err := e.MergeTracks(ctx, path, MergeSpec{ExternalFiles: []string{extSub}}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -596,5 +614,367 @@ func TestValidateExternalFiles_SymlinkCannotEscapeRoots(t *testing.T) {
 	e := &Engine{AllowedRoots: func() []string { return []string{root} }}
 	if err := e.ValidateExternalFiles(mkv, []string{link}); err == nil {
 		t.Error("symlink pointing outside the allowed roots was accepted")
+	}
+}
+
+func TestPathWithin(t *testing.T) {
+	cases := []struct {
+		path  string
+		roots []string
+		want  bool
+	}{
+		{"/media/tv/show.srt", []string{"/media/tv"}, true},
+		{"/media/tv", []string{"/media/tv"}, true},
+		{"/media/tvx/show.srt", []string{"/media/tv"}, false},
+		{"/etc/passwd", []string{"/"}, true},
+		{"/etc/passwd", nil, false},
+	}
+	for _, c := range cases {
+		if got := pathWithin(c.path, c.roots); got != c.want {
+			t.Errorf("pathWithin(%q, %v) = %v, want %v", c.path, c.roots, got, c.want)
+		}
+	}
+}
+
+func TestEditMetadataTargetsRightTrack(t *testing.T) {
+	for _, bin := range []string{"mkvmerge", "mkvpropedit"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skip(bin + " not installed")
+		}
+	}
+	dir := t.TempDir()
+	path := makeFixture(t, dir)
+	p := &probe.Prober{}
+	e := &Engine{Prober: p}
+	ctx := context.Background()
+
+	before, err := p.Probe(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jpn := before.StreamsOfType("audio")[1]
+	if _, err := e.EditMetadata(ctx, path, []MetadataEdit{{TrackIndex: jpn.Index, Language: "ger"}}, false); err != nil {
+		t.Fatal(err)
+	}
+	after, err := p.Probe(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := langs(after, "audio"); !slices.Equal(got, []string{"eng", "ger", "fre"}) {
+		t.Errorf("audio langs after edit = %v, want [eng ger fre]", got)
+	}
+}
+
+func TestReplaceGuards(t *testing.T) {
+	if _, err := exec.LookPath("mkvmerge"); err != nil {
+		t.Skip("mkvmerge not installed")
+	}
+	dir := t.TempDir()
+	path := makeFixture(t, dir)
+	p := &probe.Prober{}
+	e := &Engine{Prober: p}
+	ctx := context.Background()
+	order := []int{0, 3, 2, 1, 4, 5}
+
+	link := filepath.Join(dir, "link.mkv")
+	if err := os.Symlink(path, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := e.ReorderTracks(ctx, link, ReorderSpec{TrackOrder: order}, true); !errors.Is(err, ErrSkipped) {
+		t.Errorf("symlinked path: expected ErrSkipped, got %v", err)
+	}
+	if _, err := e.EditMetadata(ctx, link, []MetadataEdit{{TrackIndex: 1, Language: "ger"}}, true); !errors.Is(err, ErrSkipped) {
+		t.Errorf("symlinked edit: expected ErrSkipped, got %v", err)
+	}
+
+	if err := os.Link(path, filepath.Join(dir, "seed.mkv")); err != nil {
+		t.Skip("hardlinks unsupported here")
+	}
+	if _, err := e.ReorderTracks(ctx, path, ReorderSpec{TrackOrder: order}, false); !errors.Is(err, ErrSkipped) {
+		t.Errorf("hardlinked reorder: expected ErrSkipped, got %v", err)
+	}
+	if _, err := e.EditMetadata(ctx, path, []MetadataEdit{{TrackIndex: 1, Language: "ger"}}, false); !errors.Is(err, ErrSkipped) {
+		t.Errorf("hardlinked edit: expected ErrSkipped, got %v", err)
+	}
+	if _, err := e.ReorderTracks(ctx, path, ReorderSpec{TrackOrder: order}, true); err != nil {
+		t.Errorf("hardlink override failed: %v", err)
+	}
+}
+
+func TestRemoveTracksKeepsCoverAttachment(t *testing.T) {
+	if _, err := exec.LookPath("mkvmerge"); err != nil {
+		t.Skip("mkvmerge not installed")
+	}
+	dir := t.TempDir()
+	src := makeFixture(t, dir)
+	cover := filepath.Join(dir, "cover.jpg")
+	if b, err := exec.Command("ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=red:size=64x64", "-frames:v", "1", cover).CombinedOutput(); err != nil {
+		t.Fatalf("cover: %v: %s", err, b)
+	}
+	path := filepath.Join(dir, "cover.mkv")
+	if b, err := exec.Command("mkvmerge", "-q", "-o", path, "--attachment-mime-type", "image/jpeg", "--attach-file", cover, src).CombinedOutput(); err != nil {
+		t.Fatalf("attach: %v: %s", err, b)
+	}
+	p := &probe.Prober{}
+	e := &Engine{Prober: p}
+	ctx := context.Background()
+	before, err := p.Probe(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before.StreamsOfType("video")) != 1 || len(before.StreamsOfType("attachment")) != 1 {
+		t.Fatalf("cover art must probe as an attachment, got %+v", before.Streams)
+	}
+	res, err := e.RemoveTracks(ctx, path, RemovalSpec{AudioIdx: []int{before.StreamsOfType("audio")[1].Index}}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Tool != "mkvmerge" {
+		t.Errorf("expected mkvmerge path, got %s", res.Tool)
+	}
+	after, err := p.Probe(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.StreamsOfType("video")) != 1 || len(after.StreamsOfType("attachment")) != 1 {
+		t.Errorf("after remux: want 1 video + 1 attachment, got %+v", after.Streams)
+	}
+}
+
+func TestReplaceOriginalRefusesChangedFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "movie.mkv")
+	os.WriteFile(path, []byte("old"), 0o644)
+	orig, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upgrade := filepath.Join(dir, "upgrade.mkv")
+	os.WriteFile(upgrade, []byte("upgrade"), 0o644)
+	if err := os.Rename(upgrade, path); err != nil {
+		t.Fatal(err)
+	}
+	tmp, err := tempPath(dir, "movie", ".mkv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceOriginal(tmp, path, orig); err == nil {
+		t.Fatal("replaceOriginal must refuse when the original was replaced mid-run")
+	}
+	if b, _ := os.ReadFile(path); string(b) != "upgrade" {
+		t.Errorf("upgraded file was clobbered: %q", b)
+	}
+}
+
+func TestMkvWarningsOnly(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	ctx := context.Background()
+	if err := exec.Command("sh", "-c", "exit 1").Run(); !mkvWarningsOnly(ctx, err) {
+		t.Errorf("exit 1 must count as warnings-only, got %v", err)
+	}
+	if err := exec.Command("sh", "-c", "exit 2").Run(); mkvWarningsOnly(ctx, err) {
+		t.Error("exit 2 must be a failure")
+	}
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := exec.Command("sh", "-c", "exit 1").Run(); mkvWarningsOnly(cctx, err) {
+		t.Error("a cancelled run must be a failure")
+	}
+	kctx, kcancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer kcancel()
+	if err := exec.CommandContext(kctx, "sh", "-c", "sleep 5").Run(); mkvWarningsOnly(ctx, err) {
+		t.Errorf("a killed run must be a failure, got %v", err)
+	}
+}
+
+func TestDeleteSidecarConcurrentSameName(t *testing.T) {
+	root := t.TempDir()
+	recycle := filepath.Join(root, "recycle")
+	e := &Engine{RecycleDir: recycle}
+	const n = 8
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		d := filepath.Join(root, strconv.Itoa(i))
+		os.MkdirAll(d, 0o755)
+		sub := filepath.Join(d, "movie.en.srt")
+		os.WriteFile(sub, []byte(strconv.Itoa(i)), 0o644)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := e.DeleteSidecar(sub, false); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if entries, _ := os.ReadDir(recycle); len(entries) != n {
+		t.Fatalf("expected %d recycled files, got %d", n, len(entries))
+	}
+}
+
+func TestDeleteSidecarRecycleLongName(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, strings.Repeat("字", 80)+".en.srt")
+	if err := os.WriteFile(sub, []byte("1"), 0o644); err != nil {
+		t.Skipf("long names unsupported: %v", err)
+	}
+	e := &Engine{RecycleDir: filepath.Join(dir, "recycle")}
+	done := make(chan error, 1)
+	go func() { _, err := e.DeleteSidecar(sub, false); done <- err }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("DeleteSidecar hung on a long filename")
+	}
+	if _, err := os.Stat(sub); !os.IsNotExist(err) {
+		t.Errorf("original still present: %v", err)
+	}
+}
+
+func TestTempPathLongBase(t *testing.T) {
+	dir := t.TempDir()
+	tmp, err := tempPath(dir, strings.Repeat("é", 120), ".mkv")
+	if err != nil {
+		t.Fatalf("long base name: %v", err)
+	}
+	if len(filepath.Base(tmp)) > 255 || !strings.HasSuffix(tmp, ".mkv") || !utf8.ValidString(tmp) {
+		t.Errorf("bad temp name %q (%d bytes)", tmp, len(filepath.Base(tmp)))
+	}
+}
+
+func TestEditMetadataClearsTitle(t *testing.T) {
+	for _, bin := range []string{"mkvmerge", "mkvpropedit"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skip(bin + " not installed")
+		}
+	}
+	dir := t.TempDir()
+	path := makeFixture(t, dir)
+	p := &probe.Prober{}
+	e := &Engine{Prober: p}
+	ctx := context.Background()
+	res, err := p.Probe(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := res.StreamsOfType("audio")[0].Index
+	titleOf := func() string {
+		r, err := p.Probe(ctx, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range r.Streams {
+			if s.Index == idx {
+				return s.Title
+			}
+		}
+		return "?"
+	}
+	named, empty := "Commentary", ""
+	if _, err := e.EditMetadata(ctx, path, []MetadataEdit{{TrackIndex: idx, Title: &named}}, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := titleOf(); got != named {
+		t.Fatalf("title after set = %q, want %q", got, named)
+	}
+	if _, err := e.EditMetadata(ctx, path, []MetadataEdit{{TrackIndex: idx, Title: &empty}}, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := titleOf(); got != "" {
+		t.Errorf("title after clear = %q, want empty", got)
+	}
+}
+
+func TestRemoveTracksDuplicateIndexes(t *testing.T) {
+	if _, err := exec.LookPath("mkvmerge"); err != nil {
+		t.Skip("mkvmerge not installed")
+	}
+	dir := t.TempDir()
+	path := makeFixture(t, dir)
+	p := &probe.Prober{}
+	e := &Engine{Prober: p}
+	ctx := context.Background()
+	before, err := p.Probe(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := before.StreamsOfType("audio")[1].Index
+	if _, err := e.RemoveTracks(ctx, path, RemovalSpec{AudioIdx: []int{a, a}}, Options{}); err != nil {
+		t.Fatalf("duplicate index: %v", err)
+	}
+	after, err := p.Probe(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(after.StreamsOfType("audio")), len(before.StreamsOfType("audio"))-1; got != want {
+		t.Errorf("audio tracks = %d, want %d", got, want)
+	}
+}
+
+func TestEditMetadataKeepsUnchangedIETFLanguage(t *testing.T) {
+	for _, bin := range []string{"mkvmerge", "mkvpropedit"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skip(bin + " not installed")
+		}
+	}
+	dir := t.TempDir()
+	path := makeFixture(t, dir)
+	p := &probe.Prober{}
+	e := &Engine{Prober: p}
+	ctx := context.Background()
+	res, err := p.Probe(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := res.StreamsOfType("audio")[0]
+	if out, err := exec.Command("mkvpropedit", path, "--edit", "track:"+strconv.Itoa(a.MkvID+1), "--set", "language=pt-BR").CombinedOutput(); err != nil {
+		t.Fatalf("seed IETF tag: %v: %s", err, out)
+	}
+	res, err = p.Probe(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a = res.StreamsOfType("audio")[0]
+	title := "Main"
+	if _, err := e.EditMetadata(ctx, path, []MetadataEdit{{TrackIndex: a.Index, Language: a.Lang, Title: &title}}, false); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("mkvmerge", "-J", path).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ident struct {
+		Tracks []struct {
+			ID         int `json:"id"`
+			Properties struct {
+				LanguageIETF string `json:"language_ietf"`
+			} `json:"properties"`
+		} `json:"tracks"`
+	}
+	if err := json.Unmarshal(out, &ident); err != nil {
+		t.Fatal(err)
+	}
+	for _, tr := range ident.Tracks {
+		if tr.ID == a.MkvID && tr.Properties.LanguageIETF != "pt-BR" {
+			t.Errorf("language_ietf = %q after a title-only edit, want pt-BR", tr.Properties.LanguageIETF)
+		}
+	}
+}
+
+func TestRemovedBitratesKnown(t *testing.T) {
+	res := &probe.Result{Duration: 60, Streams: []probe.Stream{
+		{Index: 1, Type: "audio", BitRate: 640000},
+		{Index: 2, Type: "audio"},
+	}}
+	if !removedBitratesKnown(res, RemovalSpec{AudioIdx: []int{1}}) {
+		t.Error("stream with a bitrate reported unknown")
+	}
+	if removedBitratesKnown(res, RemovalSpec{AudioIdx: []int{1, 2}}) {
+		t.Error("stream without a bitrate reported known; the 70% floor would refuse a valid removal")
 	}
 }

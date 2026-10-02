@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -420,5 +421,152 @@ func TestAuthLimiter_SweepDropsExpiredWindows(t *testing.T) {
 	defer l.mu.Unlock()
 	if len(l.fails) != 0 {
 		t.Errorf("sweep left %d stale entries", len(l.fails))
+	}
+}
+
+func TestCSRF_KeylessMutationNeedsPreflight(t *testing.T) {
+	_, h := newTestServer(t)
+	cases := []struct {
+		name    string
+		headers map[string]string
+		want403 bool
+	}{
+		{"text/plain", map[string]string{"Content-Type": "text/plain"}, true},
+		{"no headers", nil, true},
+		{"form", map[string]string{"Content-Type": "application/x-www-form-urlencoded"}, true},
+		{"json with charset", map[string]string{"Content-Type": "application/json; charset=utf-8"}, false},
+		{"csrf header", map[string]string{csrfHeader: csrfValue}, false},
+	}
+	for _, c := range cases {
+		req := httptest.NewRequest("POST", "/api/v1/batch", strings.NewReader(`{}`))
+		for k, v := range c.headers {
+			req.Header.Set(k, v)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if (w.Code == http.StatusForbidden) != c.want403 {
+			t.Errorf("%s: code = %d, want403 = %v", c.name, w.Code, c.want403)
+		}
+	}
+	req := httptest.NewRequest("GET", "/api/v1/jobs", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("keyless GET = %d, want 200", w.Code)
+	}
+}
+
+func TestAuthLimiter_StaleCookieDoesNotLockOut(t *testing.T) {
+	_, h := newAuthServer(t)
+	for i := 0; i < authFailLimit+5; i++ {
+		req := httptest.NewRequest("GET", "/api/v1/events", nil)
+		req.RemoteAddr = "198.51.100.7:4000"
+		req.AddCookie(&http.Cookie{Name: sessionCookie, Value: "stale"})
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("stale cookie = %d, want 401", w.Code)
+		}
+	}
+	req := httptest.NewRequest("GET", "/api/v1/jobs", nil)
+	req.RemoteAddr = "198.51.100.7:4000"
+	req.Header.Set("X-Api-Key", "secret")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("valid key after stale cookies = %d, want 200", w.Code)
+	}
+}
+
+func TestPathWithin(t *testing.T) {
+	cases := []struct {
+		path, root string
+		want       bool
+	}{
+		{"/media/tv/a.mkv", "/", true},
+		{"/", "/", true},
+		{"/media/tv", "/media", true},
+		{"/media", "/media", true},
+		{"/media2", "/media", false},
+		{"/media/../etc", "/media", false},
+		{"/media/..x", "/media", true},
+	}
+	for _, c := range cases {
+		if got := pathWithin(c.path, c.root); got != c.want {
+			t.Errorf("pathWithin(%q, %q) = %v, want %v", c.path, c.root, got, c.want)
+		}
+	}
+	if !pathAllowed("/srv/x", []string{"/"}) {
+		t.Error("root / must allow every absolute path")
+	}
+}
+
+func TestAddLibrary_RejectsRelativePath(t *testing.T) {
+	_, h := newTestServer(t)
+	for _, body := range []string{`{"path":""}`, `{"path":"media/tv"}`, `{}`} {
+		rec := doJSON(t, h, "POST", "/api/v1/libraries", body)
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "path must be absolute") {
+			t.Errorf("%s = %d %s, want 400 path must be absolute", body, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestFileJobs_InvalidSidecarCreatesNoJobs(t *testing.T) {
+	s, h := newTestServer(t)
+	dir := t.TempDir()
+	lib := &store.Library{Name: "L", Path: dir, Kind: "other", HardlinkPolicy: "skip"}
+	if err := s.Store.AddLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	var files [2]*store.MediaFile
+	var scIDs [2]int64
+	for i := range files {
+		files[i] = &store.MediaFile{LibraryID: lib.ID, Path: filepath.Join(dir, string(rune('a'+i))+".mkv"), Size: 1}
+		if err := s.Store.UpsertMediaFile(files[i]); err != nil {
+			t.Fatal(err)
+		}
+		sc := store.Sidecar{Path: files[i].Path + ".srt", Name: "x.srt", Ext: "srt"}
+		if err := s.Store.ReplaceSidecars(files[i].ID, []store.Sidecar{sc}); err != nil {
+			t.Fatal(err)
+		}
+		f, err := s.Store.GetFile(files[i].ID)
+		if err != nil || len(f.Sidecars) != 1 {
+			t.Fatalf("sidecars for file %d: %v %v", files[i].ID, f, err)
+		}
+		scIDs[i] = f.Sidecars[0].ID
+	}
+	body := `{"remove_audio":[1],"delete_sidecars":[` +
+		strconv.FormatInt(scIDs[0], 10) + "," + strconv.FormatInt(scIDs[1], 10) + `]}`
+	rec := doJSON(t, h, "POST", "/api/v1/files/"+strconv.FormatInt(files[0].ID, 10)+"/jobs", body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("foreign sidecar = %d %s, want 400", rec.Code, rec.Body.String())
+	}
+	_, total, err := s.Store.ListJobs("", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 0 {
+		t.Errorf("rejected request left %d jobs queued", total)
+	}
+}
+
+func TestFileJobs_StaleExpectationRejected(t *testing.T) {
+	s, h := newTestServer(t)
+	dir := t.TempDir()
+	lib := &store.Library{Name: "L", Path: dir, Kind: "other", HardlinkPolicy: "skip"}
+	if err := s.Store.AddLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	f := &store.MediaFile{LibraryID: lib.ID, Path: filepath.Join(dir, "a.mkv"), Size: 100, Mtime: 200}
+	if err := s.Store.UpsertMediaFile(f); err != nil {
+		t.Fatal(err)
+	}
+	rec := doJSON(t, h, "POST", "/api/v1/files/"+strconv.FormatInt(f.ID, 10)+"/jobs",
+		`{"remove_audio":[1],"expect_size":100,"expect_mtime":199}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("stale expectation = %d %s, want 409", rec.Code, rec.Body.String())
+	}
+	if _, total, _ := s.Store.ListJobs("", 0, 0); total != 0 {
+		t.Errorf("stale request queued %d jobs", total)
 	}
 }

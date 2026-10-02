@@ -3,12 +3,15 @@ package scan
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/krabhi4/muxprune/internal/probe"
@@ -21,6 +24,8 @@ var videoExts = map[string]bool{
 }
 
 func IsVideo(name string) bool { return videoExts[strings.ToLower(filepath.Ext(name))] }
+
+var errLookup = errors.New("db lookup failed")
 
 // Notifier receives progress events; the API layer plugs its SSE hub in here.
 type Notifier interface {
@@ -75,7 +80,8 @@ func (sc *Scanner) ScanLibrary(ctx context.Context, lib *store.Library) error {
 	dirSizes := map[string]map[string]int64{} // dir -> filename -> size
 
 	var walkErrSeen bool
-	err := filepath.WalkDir(lib.Path, func(path string, d fs.DirEntry, err error) error {
+	walkRoot := strings.TrimSuffix(lib.Path, string(filepath.Separator)) + string(filepath.Separator)
+	err := filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			walkErrSeen = true
 			return nil // unreadable subtree: skip, do not abort the scan
@@ -84,19 +90,34 @@ func (sc *Scanner) ScanLibrary(ctx context.Context, lib *store.Library) error {
 			return ctx.Err()
 		}
 		if d.IsDir() {
-			if strings.HasPrefix(d.Name(), ".") && path != lib.Path {
+			if strings.HasPrefix(d.Name(), ".") && path != walkRoot {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 		name := d.Name()
 		if strings.HasPrefix(name, ".") {
+			if strings.Contains(name, ".muxprune.tmp.") {
+				if info, err := d.Info(); err == nil && time.Since(info.ModTime()) > 24*time.Hour {
+					if err := os.Remove(path); err != nil {
+						fmt.Fprintf(os.Stderr, "scan: remove stale temp file %s: %v\n", path, err)
+					} else {
+						fmt.Fprintf(os.Stderr, "scan: removed stale temp file %s\n", path)
+					}
+				}
+			}
 			return nil
 		}
 		dir := filepath.Dir(path)
 		dirFiles[dir] = append(dirFiles[dir], name)
 		info, err := d.Info()
+		if err == nil && d.Type()&fs.ModeSymlink != 0 {
+			info, err = os.Stat(path)
+		}
 		if err != nil {
+			if IsVideo(name) && !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, syscall.ELOOP) {
+				walkErrSeen = true
+			}
 			return nil
 		}
 		if dirSizes[dir] == nil {
@@ -120,10 +141,12 @@ func (sc *Scanner) ScanLibrary(ctx context.Context, lib *store.Library) error {
 			return ctx.Err()
 		}
 		dir := filepath.Dir(v.path)
-		unchanged, id, err := sc.scanOne(ctx, lib, v.path, v.info, dirFiles[dir], dirSizes[dir])
+		unchanged, id, err := sc.scanOne(ctx, lib, v.path, v.info, dirFiles[dir], dirSizes[dir], start)
 		if err != nil {
 			if id != 0 {
 				pendingIDs = append(pendingIDs, id)
+			} else if errors.Is(err, errLookup) {
+				walkErrSeen = true
 			}
 			fmt.Fprintf(os.Stderr, "scan: %s: %v\n", v.path, err)
 		} else if unchanged {
@@ -134,8 +157,24 @@ func (sc *Scanner) ScanLibrary(ctx context.Context, lib *store.Library) error {
 		}
 	}
 
-	if err := sc.Store.TouchFilesBulk(pendingIDs); err != nil {
+	cur, err := sc.Store.GetLibrary(lib.ID)
+	if err != nil {
 		return err
+	}
+	if cur == nil || cur.Path != lib.Path {
+		fmt.Fprintf(os.Stderr, "scan: library %d was removed or its path changed during the scan; skipping prune\n", lib.ID)
+		sc.notify(progress{LibraryID: lib.ID, Phase: "done", Done: len(videos), Total: len(videos)})
+		return nil
+	}
+
+	if err := sc.Store.TouchFilesBulk(pendingIDs, start); err != nil {
+		return err
+	}
+
+	if moved, err := sc.Store.PruneFilesOutside(lib.ID, lib.Path); err != nil {
+		return err
+	} else if moved > 0 {
+		fmt.Fprintf(os.Stderr, "scan: library %d: removed %d records outside %s\n", lib.ID, moved, lib.Path)
 	}
 
 	if len(videos) == 0 {
@@ -147,7 +186,7 @@ func (sc *Scanner) ScanLibrary(ctx context.Context, lib *store.Library) error {
 	}
 
 	if walkErrSeen {
-		fmt.Fprintf(os.Stderr, "scan: library %d: walk had unreadable subtrees; skipping prune to avoid data loss\n", lib.ID)
+		fmt.Fprintf(os.Stderr, "scan: library %d: scan had unreadable entries or db errors; skipping prune to avoid data loss\n", lib.ID)
 		sc.notify(progress{LibraryID: lib.ID, Phase: "done", Done: len(videos), Total: len(videos)})
 		return nil
 	}
@@ -160,7 +199,7 @@ func (sc *Scanner) ScanLibrary(ctx context.Context, lib *store.Library) error {
 	if err != nil {
 		return err
 	}
-	if ratio := sc.pruneMaxRatio(); total > 0 && float64(stale)/float64(total) > ratio {
+	if ratio := sc.pruneMaxRatio(); total > 0 && stale > 5 && float64(stale)/float64(total) > ratio {
 		fmt.Fprintf(os.Stderr, "scan: library %d: would prune %d/%d records (>%.0f%%); skipping prune (set MUXPRUNE_PRUNE_MAX_RATIO to override)\n",
 			lib.ID, stale, total, ratio*100)
 		sc.notify(progress{LibraryID: lib.ID, Phase: "done", Done: len(videos), Total: len(videos)})
@@ -195,7 +234,7 @@ func (sc *Scanner) ScanFile(ctx context.Context, lib *store.Library, path string
 			siblings = append(siblings, ent.Name())
 		}
 	}
-	_, _, err = sc.scanOne(ctx, lib, path, info, siblings, nil)
+	_, _, err = sc.scanOne(ctx, lib, path, info, siblings, nil, time.Now().Unix())
 	return err
 }
 
@@ -204,14 +243,27 @@ func (sc *Scanner) ScanFile(ctx context.Context, lib *store.Library, path string
 // all matched — only a scanned_at touch is needed (caller batches these).
 // dirSizes maps filename->size for the current directory; when non-nil it
 // avoids per-sidecar os.Stat calls.
-func (sc *Scanner) scanOne(ctx context.Context, lib *store.Library, path string, info fs.FileInfo, siblings []string, dirSizes map[string]int64) (unchanged bool, fileID int64, err error) {
+func (sc *Scanner) scanOne(ctx context.Context, lib *store.Library, path string, info fs.FileInfo, siblings []string, dirSizes map[string]int64, stamp int64) (unchanged bool, fileID int64, err error) {
+	if fi, err := os.Stat(path); err == nil {
+		info = fi
+	}
 	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	dir := filepath.Dir(path)
+
+	var longer []string
+	for _, name := range siblings {
+		if ob := strings.TrimSuffix(name, filepath.Ext(name)); IsVideo(name) && strings.HasPrefix(ob, base+".") {
+			longer = append(longer, ob)
+		}
+	}
+	ownedByLonger := func(name string) bool {
+		return slices.ContainsFunc(longer, func(ob string) bool { _, ok := MatchSidecar(name, ob); return ok })
+	}
 
 	var sidecars []store.Sidecar
 	var scNames []string
 	for _, name := range siblings {
-		if m, ok := MatchSidecar(name, base); ok {
+		if m, ok := MatchSidecar(name, base); ok && !ownedByLonger(name) {
 			var size int64
 			if dirSizes != nil {
 				size = dirSizes[name]
@@ -236,7 +288,7 @@ func (sc *Scanner) scanOne(ctx context.Context, lib *store.Library, path string,
 	// cheap bookkeeping (nlink, sidecars) needs refreshing.
 	id, oldSize, oldMtime, oldNlink, oldScSummary, hasProbe, qerr := sc.Store.GetFileByPathMeta(path)
 	if qerr != nil {
-		return false, 0, qerr
+		return false, 0, fmt.Errorf("%w: %w", errLookup, qerr)
 	}
 	if id != 0 && hasProbe && oldSize == info.Size() && oldMtime == info.ModTime().Unix() {
 		// If nlink and sidecar summary also match, the file is completely
@@ -245,7 +297,7 @@ func (sc *Scanner) scanOne(ctx context.Context, lib *store.Library, path string,
 		if oldNlink == nlink && oldScSummary == scSummary {
 			return true, id, nil
 		}
-		if err := sc.Store.TouchFile(id, nlink, scSummary); err != nil {
+		if err := sc.Store.TouchFile(id, nlink, scSummary, stamp); err != nil {
 			return false, id, err
 		}
 		return false, id, sc.Store.ReplaceSidecars(id, sidecars)
@@ -257,7 +309,7 @@ func (sc *Scanner) scanOne(ctx context.Context, lib *store.Library, path string,
 	}
 	probeJSON, err := json.Marshal(res)
 	if err != nil {
-		return false, 0, err
+		return false, id, err
 	}
 	parsed := ParsePath(lib.Path, path)
 	mf := &store.MediaFile{
@@ -270,9 +322,10 @@ func (sc *Scanner) scanOne(ctx context.Context, lib *store.Library, path string,
 		SubSummary:     summarizeStreams(res, "subtitle"),
 		SidecarSummary: scSummary,
 		ProbeJSON:      string(probeJSON),
+		ScannedAt:      stamp,
 	}
 	if err := sc.Store.UpsertMediaFile(mf); err != nil {
-		return false, 0, err
+		return false, id, err
 	}
 	return false, mf.ID, sc.Store.ReplaceSidecars(mf.ID, sidecars)
 }

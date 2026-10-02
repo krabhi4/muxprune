@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -34,9 +35,10 @@ type libWatcher struct {
 	onStatus   func(libID int64, status string)
 	watchLimit int
 
-	fsw    *fsnotify.Watcher
-	ctx    context.Context
-	cancel context.CancelFunc
+	fsw      *fsnotify.Watcher
+	rootInfo os.FileInfo
+	ctx      context.Context
+	cancel   context.CancelFunc
 
 	mu       sync.Mutex
 	timer    *time.Timer
@@ -68,6 +70,7 @@ func (w *libWatcher) start(parent context.Context) error {
 		cancel()
 		return err
 	}
+	w.rootInfo, _ = os.Stat(w.root)
 	w.addRecursive(w.root)
 	go w.loop(ctx)
 	return nil
@@ -101,6 +104,12 @@ func (w *libWatcher) isDead() bool {
 	return w.dead
 }
 
+func (w *libWatcher) watchingRoot() bool {
+	cur, err := os.Stat(w.root)
+	return err == nil && w.rootInfo != nil && os.SameFile(cur, w.rootInfo) &&
+		slices.Contains(w.fsw.WatchList(), w.root)
+}
+
 func (w *libWatcher) isDegraded() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -118,28 +127,39 @@ func (w *libWatcher) died(reason string) {
 }
 
 func (w *libWatcher) addRecursive(root string) {
-	filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	known := map[string]bool{}
+	for _, p := range w.fsw.WatchList() {
+		known[p] = true
+	}
+	w.mu.Lock()
+	w.watches = len(known)
+	w.mu.Unlock()
+	walkRoot := strings.TrimSuffix(root, string(filepath.Separator)) + string(filepath.Separator)
+	filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
 		if !d.IsDir() {
 			return nil
 		}
+		if path == walkRoot {
+			path = root
+		}
 		if path != root && strings.HasPrefix(d.Name(), ".") {
 			return filepath.SkipDir
 		}
-		if !w.addWatch(path) {
+		if !w.addWatch(path, known) {
 			return filepath.SkipDir
 		}
 		return nil
 	})
 }
 
-func (w *libWatcher) addWatch(path string) bool {
+func (w *libWatcher) addWatch(path string, known map[string]bool) bool {
 	// The limit check and the counter increment stay under one lock so the
 	// pair cannot interleave if a second caller is ever added.
 	w.mu.Lock()
-	if w.watchLimit > 0 && w.watches >= w.watchLimit {
+	if !known[path] && w.watchLimit > 0 && w.watches >= w.watchLimit {
 		degraded := w.degraded
 		w.degraded = true
 		w.mu.Unlock()
@@ -148,8 +168,9 @@ func (w *libWatcher) addWatch(path string) bool {
 		}
 		return false
 	}
-	if err := w.fsw.Add(path); err == nil {
+	if err := w.fsw.Add(path); err == nil && !known[path] {
 		w.watches++
+		known[path] = true
 	}
 	w.mu.Unlock()
 	return true
@@ -183,6 +204,7 @@ func (w *libWatcher) loop(ctx context.Context) {
 				w.degraded = false
 				w.mu.Unlock()
 				w.addRecursive(w.root)
+				w.schedule()
 				if !w.isDegraded() {
 					w.status("watching")
 				}
@@ -193,8 +215,17 @@ func (w *libWatcher) loop(ctx context.Context) {
 
 func (w *libWatcher) handle(ev fsnotify.Event) {
 	name := filepath.Base(ev.Name)
+	if ev.Op&(fsnotify.Rename|fsnotify.Remove) != 0 {
+		w.fsw.Remove(ev.Name)
+		prefix := ev.Name + string(filepath.Separator)
+		for _, p := range w.fsw.WatchList() {
+			if strings.HasPrefix(p, prefix) {
+				w.fsw.Remove(p)
+			}
+		}
+	}
 	if ev.Op&fsnotify.Create != 0 {
-		if fi, err := os.Stat(ev.Name); err == nil && fi.IsDir() {
+		if fi, err := os.Lstat(ev.Name); err == nil && fi.IsDir() {
 			if !strings.HasPrefix(name, ".") {
 				w.addRecursive(ev.Name)
 				w.schedule()
@@ -202,7 +233,7 @@ func (w *libWatcher) handle(ev fsnotify.Event) {
 			return
 		}
 	}
-	if isRelevantFile(name) {
+	if isRelevantFile(name) || (ev.Op&(fsnotify.Rename|fsnotify.Remove) != 0 && !strings.HasPrefix(name, ".")) {
 		w.schedule()
 	}
 }

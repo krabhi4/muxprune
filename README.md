@@ -35,7 +35,7 @@ services:
       - PGID=1000
       - TZ=Etc/UTC
       - UMASK=022
-      # - MUXPRUNE_API_KEY=your-secret-api-key # Requires X-Api-Key header on API endpoints
+      - MUXPRUNE_API_KEY=${MUXPRUNE_API_KEY:?set MUXPRUNE_API_KEY to a long random secret} # Required for the published port: without a key muxprune binds to loopback only
       # - MUXPRUNE_WORKERS=1                   # Concurrent remux jobs (1 is recommended for HDDs/SSDs)
       # - MUXPRUNE_RECYCLE_DAYS=7              # Keep deleted sidecars in config/recycle (0 = delete permanently)
       # - MUXPRUNE_AUTOSCAN_DEFAULT=21600     # Default auto-scan interval (sec) for new libraries (0 = off, min 60)
@@ -47,6 +47,7 @@ services:
     ports:
       - "8484:8484"
     restart: unless-stopped
+    stop_grace_period: 45s
 ```
 
 ---
@@ -62,7 +63,7 @@ services:
 | `MUXPRUNE_AUTOSCAN_DEFAULT` | Default auto-scan interval (seconds) for newly added libraries; `0` disables, minimum `60` | `21600` (6h) |
 | `MUXPRUNE_WATCH` | Enable the real-time filesystem watcher (`0`/`false`/`off` uses periodic scans only) | `1` (on) |
 | `MUXPRUNE_API_KEY` | Optional authorization key for the REST API | (none, open API) |
-| `MUXPRUNE_BROWSE_ROOTS` | Colon-separated directories the folder picker may list, and the only places external merge inputs may come from. Unset falls back to your library paths plus conventional media mounts (`/media`, `/mnt`, `/data`, `/tv`, `/movies`, `/music`, `/srv`, `/storage`, `/Volumes`) and your home directory | (see left) |
+| `MUXPRUNE_BROWSE_ROOTS` | Colon-separated directories the folder picker may list, and the only places external merge inputs may come from. Unset, the picker falls back to your library paths plus conventional media mounts (`/media`, `/mnt`, `/data`, `/tv`, `/movies`, `/music`, `/srv`, `/storage`, `/Volumes`) and your home directory, while merge inputs are limited to your library paths | (see left) |
 | `MUXPRUNE_SECURE_COOKIE` | Force the `Secure` flag on the session cookie. Only needed behind a TLS-terminating proxy that does not set `X-Forwarded-Proto` | `0` (auto-detected) |
 | `PUID` / `PGID` | User and Group ID mapping to match media folder ownership | `1000`/`1000` |
 | `UMASK` | File permissions mask for newly created files | `022` |

@@ -2,7 +2,10 @@
 
 package engine
 
-import "os/exec"
+import (
+	"os/exec"
+	"sync"
+)
 
 // wrapNice prepends nice/ionice to the command so remux subprocesses run at
 // the lowest scheduling priority, keeping the host responsive.
@@ -12,10 +15,18 @@ func wrapNice(name string, args []string) (string, []string) {
 		return name, args
 	}
 	wrapped := []string{"-n", "19"}
-	if ionicePath, err := exec.LookPath("ionice"); err == nil {
+	if ionicePath := usableIonice(); ionicePath != "" {
 		wrapped = append(wrapped, ionicePath, "-c", "3")
 	}
 	wrapped = append(wrapped, name)
 	wrapped = append(wrapped, args...)
 	return nicePath, wrapped
 }
+
+var usableIonice = sync.OnceValue(func() string {
+	path, err := exec.LookPath("ionice")
+	if err != nil || exec.Command(path, "-c", "3", "true").Run() != nil {
+		return ""
+	}
+	return path
+})

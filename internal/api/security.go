@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"fmt"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -106,10 +107,14 @@ func resolveRoots(roots []string) []string {
 	return out
 }
 
+func pathWithin(path, root string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 func pathAllowed(path string, roots []string) bool {
 	for _, root := range roots {
-		root = filepath.Clean(root)
-		if path == root || strings.HasPrefix(path+string(filepath.Separator), root+string(filepath.Separator)) {
+		if pathWithin(path, root) {
 			return true
 		}
 	}
@@ -155,6 +160,14 @@ func requestIsTLS(r *http.Request) bool {
 		proto = proto[:i]
 	}
 	return strings.EqualFold(strings.TrimSpace(proto), "https")
+}
+
+func preflightForced(r *http.Request) bool {
+	if r.Header.Get(csrfHeader) == csrfValue {
+		return true
+	}
+	mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	return err == nil && mt == "application/json"
 }
 
 // ---- request rate limiting ----

@@ -572,3 +572,255 @@ func TestListJobs_ClampsOffset(t *testing.T) {
 		t.Fatalf("huge offset: %v", err)
 	}
 }
+
+func TestJobFingerprint_RecordedAndCopiedOnRetry(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	lib := &Library{Name: "L", Path: "/x", Kind: "other", HardlinkPolicy: "skip"}
+	if err := s.AddLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	f := &MediaFile{LibraryID: lib.ID, Path: "/x/a.mkv", Size: 100, Mtime: 7}
+	if err := s.UpsertMediaFile(f); err != nil {
+		t.Fatal(err)
+	}
+	j, err := s.CreateJob("remux", f.ID, f.Path, map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.FileSize.Int64 != 100 || j.FileMtime.Int64 != 7 || !j.FileSize.Valid || !j.FileMtime.Valid {
+		t.Fatalf("fingerprint = %v/%v, want 100/7", j.FileSize, j.FileMtime)
+	}
+	if err := s.FinishJob(j.ID, "failed", "boom", 0); err != nil {
+		t.Fatal(err)
+	}
+	f.Size, f.Mtime = 50, 9
+	if err := s.UpsertMediaFile(f); err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.RetryJob(j.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.FileSize.Int64 != 100 || r.FileMtime.Int64 != 7 || r.MediaFileID() != f.ID {
+		t.Errorf("retry fingerprint = %v/%v file=%d, want original 100/7 file=%d", r.FileSize, r.FileMtime, r.MediaFileID(), f.ID)
+	}
+	nf, err := s.CreateJob("scan_all", 0, "all", map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nf.FileSize.Valid || nf.FileMtime.Valid {
+		t.Errorf("fileless job got a fingerprint: %v/%v", nf.FileSize, nf.FileMtime)
+	}
+}
+
+func TestUpsertMediaFile_ReturnsOwnIDOnConflict(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	lib := &Library{Name: "L", Path: "/x", Kind: "other", HardlinkPolicy: "skip"}
+	if err := s.AddLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	a := &MediaFile{LibraryID: lib.ID, Path: "/x/a.mkv", Size: 1}
+	b := &MediaFile{LibraryID: lib.ID, Path: "/x/b.mkv", Size: 1}
+	if err := s.UpsertMediaFile(a); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertMediaFile(b); err != nil {
+		t.Fatal(err)
+	}
+	again := &MediaFile{LibraryID: lib.ID, Path: "/x/a.mkv", Size: 2}
+	if err := s.UpsertMediaFile(again); err != nil {
+		t.Fatal(err)
+	}
+	if again.ID != a.ID {
+		t.Errorf("upsert of existing path returned id %d, want %d", again.ID, a.ID)
+	}
+}
+
+func TestUpdateLibrary_PathChangeDropsFiles(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	lib := &Library{Name: "L", Path: "/x", Kind: "other", HardlinkPolicy: "skip"}
+	if err := s.AddLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	f := &MediaFile{LibraryID: lib.ID, Path: "/x/a.mkv", Size: 1}
+	if err := s.UpsertMediaFile(f); err != nil {
+		t.Fatal(err)
+	}
+	j, err := s.CreateJob("remux", f.ID, f.Path, map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lib.Name = "renamed"
+	if err := s.UpdateLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.CountFilesByLibrary(lib.ID); n != 1 {
+		t.Fatalf("files after rename-only update = %d, want 1", n)
+	}
+	lib.Path = "/y"
+	if err := s.UpdateLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.CountFilesByLibrary(lib.ID); n != 0 {
+		t.Errorf("files after path change = %d, want 0", n)
+	}
+	got, err := s.GetJob(j.ID)
+	if err != nil || got == nil {
+		t.Fatalf("job history lost: %v", err)
+	}
+	if got.MediaFileID() != 0 || got.FilePath != "/x/a.mkv" {
+		t.Errorf("job after path change: file=%d path=%q", got.MediaFileID(), got.FilePath)
+	}
+}
+
+func TestPruneFilesOutside(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	lib := &Library{Name: "L", Path: "/media/tv", Kind: "other", HardlinkPolicy: "skip"}
+	if err := s.AddLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"/media/tv/a.mkv", "/media/tv/s1/b.mkv", "/media/tv2/c.mkv", "/old/d.mkv", "/media/tv_%/e.mkv"} {
+		if err := s.UpsertMediaFile(&MediaFile{LibraryID: lib.ID, Path: p, Size: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, err := s.PruneFilesOutside(lib.ID, "/media/tv"); err != nil || n != 3 {
+		t.Fatalf("pruned = %d, err=%v, want 3", n, err)
+	}
+	if n, _ := s.CountFilesByLibrary(lib.ID); n != 2 {
+		t.Errorf("files left = %d, want 2", n)
+	}
+	if n, err := s.PruneFilesOutside(lib.ID, "/"); err != nil || n != 0 {
+		t.Errorf("root library pruned = %d, err=%v, want 0", n, err)
+	}
+}
+
+func TestScannedAtNeverMovesBackwards(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	lib := &Library{Name: "L", Path: "/x", Kind: "other", HardlinkPolicy: "skip"}
+	if err := s.AddLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	f := &MediaFile{LibraryID: lib.ID, Path: "/x/a.mkv", Size: 1, ScannedAt: 200}
+	if err := s.UpsertMediaFile(f); err != nil {
+		t.Fatal(err)
+	}
+	f.ScannedAt = 100
+	if err := s.UpsertMediaFile(f); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.TouchFile(f.ID, 1, "", 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.TouchFilesBulk([]int64{f.ID}, 100); err != nil {
+		t.Fatal(err)
+	}
+	if stale, _ := s.CountStaleFiles(lib.ID, 200); stale != 0 {
+		t.Errorf("older scan stamp overwrote newer one: %d stale at cutoff 200", stale)
+	}
+}
+
+func TestReplaceSidecars_MovesOwnership(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	lib := &Library{Name: "L", Path: "/x", Kind: "other", HardlinkPolicy: "skip"}
+	if err := s.AddLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	a := &MediaFile{LibraryID: lib.ID, Path: "/x/a.mkv", Size: 1}
+	b := &MediaFile{LibraryID: lib.ID, Path: "/x/a.ext.mkv", Size: 1}
+	for _, f := range []*MediaFile{a, b} {
+		if err := s.UpsertMediaFile(f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sc := Sidecar{Path: "/x/a.ext.en.srt", Name: "a.ext.en.srt", Lang: "en", Ext: "srt", Size: 5}
+	if err := s.ReplaceSidecars(a.ID, []Sidecar{sc}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReplaceSidecars(b.ID, []Sidecar{sc}); err != nil {
+		t.Fatalf("sidecar owned by another file: %v", err)
+	}
+	got, err := s.GetFile(b.ID)
+	if err != nil || len(got.Sidecars) != 1 {
+		t.Fatalf("new owner sidecars = %v, err=%v", got, err)
+	}
+	if old, _ := s.GetFile(a.ID); len(old.Sidecars) != 0 {
+		t.Errorf("old owner still has %d sidecars", len(old.Sidecars))
+	}
+}
+
+func TestStore_IsScanQueuedIgnoresRunning(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.CreateJob("scan_library", 0, "/lib", map[string]any{"library_id": int64(1)}); err != nil {
+		t.Fatal(err)
+	}
+	if q, _ := s.IsScanQueued(1); !q {
+		t.Fatal("queued scan not reported as queued")
+	}
+	if _, err := s.ClaimNextJob(); err != nil {
+		t.Fatal(err)
+	}
+	if q, _ := s.IsScanQueued(1); q {
+		t.Error("running scan reported as queued; event-driven rescans would be dropped")
+	}
+	if a, _ := s.IsScanActive(1); !a {
+		t.Error("running scan not reported as active")
+	}
+}
+
+func TestHardlinkPolicyUsesInnermostLibrary(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	outer := &Library{Name: "all", Path: "/media", Kind: "other", HardlinkPolicy: "proceed"}
+	inner := &Library{Name: "tv", Path: "/media/tv", Kind: "tv", HardlinkPolicy: "skip"}
+	for _, l := range []*Library{outer, inner} {
+		if err := s.AddLibrary(l); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f := &MediaFile{LibraryID: outer.ID, Path: "/media/tv/show.mkv", Size: 1}
+	if err := s.UpsertMediaFile(f); err != nil {
+		t.Fatal(err)
+	}
+	if s.HardlinkPolicyProceeds(f.ID) {
+		t.Error("outer library's proceed policy applied to a file inside the inner skip library")
+	}
+	g := &MediaFile{LibraryID: outer.ID, Path: "/media/movies/film.mkv", Size: 1}
+	if err := s.UpsertMediaFile(g); err != nil {
+		t.Fatal(err)
+	}
+	if !s.HardlinkPolicyProceeds(g.ID) {
+		t.Error("outer library's proceed policy not applied to its own file")
+	}
+}

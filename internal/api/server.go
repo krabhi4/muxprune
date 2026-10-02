@@ -279,9 +279,18 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			return
 		}
 		if r.URL.Path == "/api/v1/webhooks/arr" && s.WebhookSecret != "" {
-			if constantTimeEqual(r.Header.Get("X-Webhook-Secret"), s.WebhookSecret) {
+			ip := clientIP(r)
+			if s.limiter.blocked(ip) {
+				writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many failed auth attempts; try again later"})
+				return
+			}
+			secret := r.Header.Get("X-Webhook-Secret")
+			if constantTimeEqual(secret, s.WebhookSecret) {
 				next.ServeHTTP(w, r)
 				return
+			}
+			if secret != "" {
+				s.limiter.fail(ip)
 			}
 			if s.APIKey == "" {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid webhook secret"})
@@ -293,6 +302,11 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			return
 		}
 		if s.APIKey == "" {
+			if mutatingMethod(r.Method) && !preflightForced(r) {
+				writeJSON(w, http.StatusForbidden, map[string]string{
+					"error": "state-changing requests need an " + csrfHeader + ": " + csrfValue + " header or a JSON content type"})
+				return
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -303,7 +317,9 @@ func (s *Server) auth(next http.Handler) http.Handler {
 		}
 		method := s.authenticate(r)
 		if method == authNone {
-			s.limiter.fail(ip)
+			if r.Header.Get("X-Api-Key") != "" {
+				s.limiter.fail(ip)
+			}
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid api key"})
 			return
 		}
@@ -585,6 +601,9 @@ func decodeLibraryReq(r *http.Request) (*libraryRequest, error) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		return nil, err
 	}
+	if !filepath.IsAbs(req.Path) {
+		return nil, cerr("path must be absolute")
+	}
 	// Store the resolved path: os.Stat and the scanner both follow symlinks,
 	// so validating the link name instead of its target would let a library
 	// escape the configured roots.
@@ -669,6 +688,9 @@ func (s *Server) handleUpdateLibrary(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, cerr("library path is outside the allowed roots"))
 		return
 	}
+	if realPath(existing.Path) == req.Path {
+		req.Path = existing.Path
+	}
 	l := &store.Library{
 		ID: id, Name: req.Name, Path: req.Path, Kind: req.Kind, HardlinkPolicy: req.HardlinkPolicy,
 		AutoScanInterval:   existing.AutoScanInterval,
@@ -684,6 +706,13 @@ func (s *Server) handleUpdateLibrary(w http.ResponseWriter, r *http.Request) {
 	if err := s.Store.UpdateLibrary(l); err != nil {
 		writeErr(w, 400, err)
 		return
+	}
+	if l.Path != existing.Path {
+		if queued, err := s.Store.IsScanQueued(l.ID); err == nil && !queued {
+			if _, err := s.Store.CreateJob("scan_library", 0, l.Path, jobs.ScanLibraryPayload{LibraryID: l.ID}); err == nil {
+				s.Runner.Wake()
+			}
+		}
 	}
 	s.reconcileMonitor()
 	writeJSON(w, 200, s.libraryView(*l))
@@ -824,7 +853,19 @@ func (s *Server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 
 // ---- job submission ----
 
+type expectFile struct {
+	ExpectSize  *int64 `json:"expect_size,omitempty"`
+	ExpectMtime *int64 `json:"expect_mtime,omitempty"`
+}
+
+func (e expectFile) changed(d *fileDetail) bool {
+	return (e.ExpectSize != nil && *e.ExpectSize != d.Size) || (e.ExpectMtime != nil && *e.ExpectMtime != d.Mtime)
+}
+
+const fileChangedMsg = "file changed since it was loaded; reload it and re-select tracks"
+
 type fileJobRequest struct {
+	expectFile
 	RemoveAudio    []int   `json:"remove_audio"` // ffprobe stream indexes
 	RemoveSubs     []int   `json:"remove_subs"`
 	DeleteSidecars []int64 `json:"delete_sidecars"` // sidecar row ids
@@ -861,15 +902,19 @@ func (s *Server) handleFileJobs(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, cerr("file not found"))
 		return
 	}
+	if req.changed(d) {
+		writeErr(w, 409, cerr(fileChangedMsg))
+		return
+	}
 
 	if req.DryRun {
 		out := map[string]any{}
 		if len(req.RemoveAudio) > 0 || len(req.RemoveSubs) > 0 {
 			res, err := s.Engine.RemoveTracks(r.Context(), d.Path,
 				engine.RemovalSpec{AudioIdx: req.RemoveAudio, SubIdx: req.RemoveSubs},
-				engine.Options{AllowHardlink: req.AllowHardlink, AllowLastAudio: req.AllowLastAudio, DryRun: true})
+				engine.Options{AllowHardlink: req.AllowHardlink || s.Store.HardlinkPolicyProceeds(d.ID), AllowLastAudio: req.AllowLastAudio, DryRun: true})
 			if err != nil {
-				writeErr(w, 400, err)
+				writeErr(w, 400, cerr("%s", err.Error()))
 				return
 			}
 			out["remux"] = res
@@ -895,8 +940,23 @@ func (s *Server) handleFileJobs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) enqueueForFile(d *fileDetail, req fileJobRequest) ([]*store.Job, error) {
+	remux := len(req.RemoveAudio) > 0 || len(req.RemoveSubs) > 0
+	var sidecars []*store.Sidecar
+	for _, scID := range req.DeleteSidecars {
+		sc, err := s.Store.GetSidecar(scID)
+		if err != nil {
+			return nil, err
+		}
+		if sc == nil || sc.FileID != d.ID {
+			return nil, cerr("sidecar %d does not belong to file %d", scID, d.ID)
+		}
+		sidecars = append(sidecars, sc)
+	}
+	if !remux && len(sidecars) == 0 {
+		return nil, cerr("nothing to do")
+	}
 	var created []*store.Job
-	if len(req.RemoveAudio) > 0 || len(req.RemoveSubs) > 0 {
+	if remux {
 		j, err := s.Store.CreateJob("remux", d.ID, d.Path, jobs.RemuxPayload{
 			AudioIdx: req.RemoveAudio, SubIdx: req.RemoveSubs,
 			AllowHardlink: req.AllowHardlink, AllowLastAudio: req.AllowLastAudio,
@@ -906,24 +966,14 @@ func (s *Server) enqueueForFile(d *fileDetail, req fileJobRequest) ([]*store.Job
 		}
 		created = append(created, j)
 	}
-	for _, scID := range req.DeleteSidecars {
-		sc, err := s.Store.GetSidecar(scID)
-		if err != nil {
-			return nil, err
-		}
-		if sc == nil || sc.FileID != d.ID {
-			return nil, cerr("sidecar %d does not belong to file %d", scID, d.ID)
-		}
+	for _, sc := range sidecars {
 		j, err := s.Store.CreateJob("delete_sidecar", d.ID, d.Path, jobs.SidecarPayload{
 			SidecarID: sc.ID, Path: sc.Path,
 		})
 		if err != nil {
-			return nil, err
+			return created, err
 		}
 		created = append(created, j)
-	}
-	if len(created) == 0 {
-		return nil, cerr("nothing to do")
 	}
 	return created, nil
 }
@@ -931,7 +981,9 @@ func (s *Server) enqueueForFile(d *fileDetail, req fileJobRequest) ([]*store.Job
 // ---- metadata editing ----
 
 type editMetadataRequest struct {
-	Edits []engine.MetadataEdit `json:"edits"`
+	expectFile
+	Edits         []engine.MetadataEdit `json:"edits"`
+	AllowHardlink bool                  `json:"allow_hardlink"`
 }
 
 func (s *Server) handleEditMetadata(w http.ResponseWriter, r *http.Request) {
@@ -962,12 +1014,16 @@ func (s *Server) handleEditMetadata(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, cerr("file not found"))
 		return
 	}
+	if req.changed(d) {
+		writeErr(w, 409, cerr(fileChangedMsg))
+		return
+	}
 	if res == nil || !res.IsMatroska() {
 		writeErr(w, 400, cerr("file is not a Matroska container; metadata editing requires MKV"))
 		return
 	}
 	j, err := s.Store.CreateJob("edit_metadata", d.ID, d.Path, jobs.EditMetadataPayload{
-		Edits: req.Edits,
+		Edits: req.Edits, AllowHardlink: req.AllowHardlink,
 	})
 	if err != nil {
 		writeErr(w, 500, err)
@@ -980,7 +1036,9 @@ func (s *Server) handleEditMetadata(w http.ResponseWriter, r *http.Request) {
 // ---- track reordering and merging ----
 
 type reorderTracksRequest struct {
-	TrackOrder []int `json:"track_order"`
+	expectFile
+	TrackOrder    []int `json:"track_order"`
+	AllowHardlink bool  `json:"allow_hardlink"`
 }
 
 func (s *Server) handleReorderTracks(w http.ResponseWriter, r *http.Request) {
@@ -1009,6 +1067,10 @@ func (s *Server) handleReorderTracks(w http.ResponseWriter, r *http.Request) {
 	}
 	if d == nil {
 		writeErr(w, 404, cerr("file not found"))
+		return
+	}
+	if req.changed(d) {
+		writeErr(w, 409, cerr(fileChangedMsg))
 		return
 	}
 	if res == nil || !res.IsMatroska() {
@@ -1049,7 +1111,7 @@ func (s *Server) handleReorderTracks(w http.ResponseWriter, r *http.Request) {
 	}
 
 	j, err := s.Store.CreateJob("reorder_tracks", d.ID, d.Path, jobs.ReorderPayload{
-		TrackOrder: req.TrackOrder,
+		TrackOrder: req.TrackOrder, AllowHardlink: req.AllowHardlink,
 	})
 	if err != nil {
 		writeErr(w, 500, err)
@@ -1060,7 +1122,9 @@ func (s *Server) handleReorderTracks(w http.ResponseWriter, r *http.Request) {
 }
 
 type mergeTracksRequest struct {
+	expectFile
 	ExternalFiles []string `json:"external_files"`
+	AllowHardlink bool     `json:"allow_hardlink"`
 }
 
 // validateExternalFiles defers to the engine so the REST API, the MCP tools,
@@ -1104,6 +1168,10 @@ func (s *Server) handleMergeTracks(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, cerr("file not found"))
 		return
 	}
+	if req.changed(d) {
+		writeErr(w, 409, cerr(fileChangedMsg))
+		return
+	}
 	if res == nil || !res.IsMatroska() {
 		writeErr(w, 400, cerr("file is not a Matroska container; merging tracks requires MKV"))
 		return
@@ -1113,7 +1181,7 @@ func (s *Server) handleMergeTracks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	j, err := s.Store.CreateJob("merge_tracks", d.ID, d.Path, jobs.MergePayload{
-		ExternalFiles: req.ExternalFiles,
+		ExternalFiles: req.ExternalFiles, AllowHardlink: req.AllowHardlink,
 	})
 	if err != nil {
 		writeErr(w, 500, err)
@@ -1222,8 +1290,14 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 				RemoveAudio: plan.RemoveAudio, RemoveSubs: plan.RemoveSubs,
 				DeleteSidecars: plan.DeleteSidecars, AllowHardlink: req.AllowHardlink,
 			})
-			if err != nil && err.Error() != "nothing to do" {
-				plan.Notes = append(plan.Notes, err.Error())
+			if err != nil {
+				msg, logIt := safeMessage(500, err)
+				if logIt {
+					logInternal(500, err)
+				}
+				if msg != "nothing to do" {
+					plan.Notes = append(plan.Notes, msg)
+				}
 			}
 			plan.Jobs = len(created)
 			totalJobs += len(created)
@@ -1263,12 +1337,19 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]string{"status": "cancelling"})
 		return
 	}
-	if err := s.Store.CancelJob(id); err != nil {
+	if err := s.cancelQueuedJob(id); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
 	s.Hub.Notify("job", map[string]any{"id": id, "status": "cancelled", "log": "cancelled by user"})
 	writeJSON(w, 200, map[string]string{"status": "cancelled"})
+}
+
+func (s *Server) cancelQueuedJob(id int64) error {
+	if j, _ := s.Store.GetJob(id); j != nil && j.Status == "running" {
+		return cerr("job is running in another muxprune process; cancel it there")
+	}
+	return s.Store.CancelJob(id)
 }
 
 func (s *Server) handleRetryJob(w http.ResponseWriter, r *http.Request) {
@@ -1329,10 +1410,10 @@ func (s *Server) handleArrWebhook(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err)
 		return
 	}
+	resolved := realPath(filepath.Clean(target))
 	for i := range libs {
-		if strings.HasPrefix(filepath.Clean(target)+string(filepath.Separator),
-			filepath.Clean(libs[i].Path)+string(filepath.Separator)) {
-			active, err := s.Store.IsScanActive(libs[i].ID)
+		if pathWithin(target, libs[i].Path) || pathWithin(resolved, libs[i].Path) {
+			active, err := s.Store.IsScanQueued(libs[i].ID)
 			if err != nil {
 				writeErr(w, 500, err)
 				return

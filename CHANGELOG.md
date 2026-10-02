@@ -5,6 +5,98 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-10-03
+
+Correctness and safety release from repeated full-codebase bug and security reviews, run until
+two consecutive rounds came back clean. The focus is on stopping wrong-track edits and data loss,
+closing the keyless CSRF hole, and making the watcher, scanner and job queue robust against
+concurrent processes and filesystem churn.
+
+### Security
+- Keyless mode (no `MUXPRUNE_API_KEY`) now rejects state-changing requests unless they carry `X-Requested-With: muxprune` or a JSON `Content-Type`. Both force a CORS preflight the server never approves, so a web page can no longer queue destructive jobs against a loopback instance with a `no-cors` text/plain POST. The Web UI, Sonarr/Radarr webhooks and MCP clients already send one of them.
+- Wrong webhook secrets count toward the failed-auth lockout, and locked-out IPs get `429` on the webhook route too.
+- An expired or unknown session cookie no longer counts as a failed login, so a stale browser tab reconnecting its event stream can't lock its own IP out.
+- Temp output files are created with `os.CreateTemp` instead of a predictable name, so a symlink planted in a media folder can't redirect a remux's output.
+- Every path passed to mkvpropedit and ffmpeg goes through the same `./` guard as mkvmerge, so a relative path starting with `-` or `@` can't be read as an option or response file.
+- The release workflow grants `packages: write` only to the publish job, and the `latest` image tag no longer moves on prerelease tags.
+
+### Changed
+- **Breaking:** library paths must be absolute. Empty or relative paths were silently stored as the process working directory.
+- **Breaking:** metadata edits, track reorders and merges now respect hardlinks like track removal always has. They are skipped on hardlinked files unless `allow_hardlink` is set. Metadata edits rewrite the file in place, so they would modify the seeding copy too. They ignore the library's "proceed" policy and are never sent with the override from the UI.
+- **Breaking:** symlinked media files are skipped for remux, reorder, merge and metadata edits. Replacing the link would leave the target untouched and leave a full copy behind.
+- The library hardlink policy "Proceed" is now honoured. It used to be stored and never read. With nested libraries, the innermost library's policy applies.
+- The example `docker-compose.yml` and README require `MUXPRUNE_API_KEY` (`${MUXPRUNE_API_KEY:?...}`). Without a key muxprune binds to loopback, so the published port was unreachable.
+- The container healthcheck honours `MUXPRUNE_PORT` and `MUXPRUNE_BIND` (including IPv6), and `MUXPRUNE_BIND` accepts bare IPv6 addresses.
+- The compose example sets `stop_grace_period: 45s` so in-flight jobs get their 30s shutdown grace before Docker kills the container.
+- `UMASK` is applied when the container runs as a non-root `--user`, and the config directory is chowned recursively so a PUID change doesn't leave the database unwritable.
+- MCP tools accept `allow_hardlink` (metadata, reorder, merge) and `expect_size`/`expect_mtime`. A metadata `title` of `""` now clears the track name; omit it to leave the title unchanged.
+
+### Fixed
+- **Wrong track removed or edited:**
+  - The file dialog sent ticked "default"/"forced" checkboxes as subtitle removals.
+  - Metadata edits selected tracks by UID instead of position, so they failed or edited the wrong track.
+  - Queued and retried jobs could run with stream indexes chosen against an older version of the file. Jobs now record the file's size and mtime and refuse to run if the file changed. The UI and MCP send the values they loaded and get `409` if the file changed in the meantime.
+  - The fingerprint check runs under a per-file lock, so a second worker can't slip past it.
+- **Data loss:**
+  - A remux no longer overwrites a file that Sonarr/Radarr replaced while the job ran.
+  - Outputs are fsynced before the rename and the directory after it.
+  - MKVs with cover art are no longer pushed onto the ffmpeg path, which turned the cover into a bogus video track.
+  - Merges refuse files containing tracks mkvmerge can't read, instead of silently dropping them.
+  - Saving metadata no longer strips regional language tags (e.g. `pt-BR`) from untouched tracks.
+  - Recycled sidecars are kept for the full retention period. A same-filesystem move kept the old mtime, so they could be purged on the next pass.
+  - Two same-named sidecars recycled in the same second no longer overwrite each other.
+- **Multiple processes:** `muxprune serve` and `muxprune mcp` on the same config directory no longer both run the job queue. One process owns the queue through a lock file. The other queues jobs, and they run in the owner. Starting `mcp` no longer marks the server's running jobs as failed.
+- **Hangs:**
+  - Recycling a sidecar with a very long filename spun forever and blocked every later delete.
+  - A remux preview blocked behind a running job on the same file.
+  - Shutdown waited out the full HTTP timeout whenever a UI tab was open.
+  - Cancelling a metadata edit could kill mkvpropedit mid-write.
+- **Watcher:**
+  - Now recovers after the library root is unmounted, remounted, deleted or renamed, and runs a catch-up scan.
+  - Keeps watching renamed and moved folders.
+  - No longer follows symlinked subfolders out of the library.
+  - Rescans when a folder is moved out.
+  - Picks up a library path change.
+  - Counts watches correctly so it no longer hits the watch limit spuriously.
+  - Rescans after an event-queue overflow.
+- **Scanner:**
+  - Libraries whose root is a symlink are walked.
+  - Symlinked videos use the target's size and mtime.
+  - Per-file stat or database errors no longer prune records of files that still exist, and a broken non-video symlink no longer disables pruning.
+  - Small libraries can prune stale records again.
+  - Concurrent scans can't prune each other's rows.
+  - Changing a library's path drops its old records and queues a rescan.
+  - Sidecars go to the video with the longest matching name, so `Movie.sample.en.srt` belongs to `Movie.sample.mkv`, not `Movie.mkv`.
+  - Leftover temp files older than 24 hours are removed.
+  - Event-driven rescans are no longer dropped while another scan is running.
+- **Jobs:**
+  - A cancel that arrives after the file was replaced reports `done`.
+  - Retrying is a single atomic step.
+  - Duplicate stream indexes are deduplicated.
+  - Post-job re-probes survive cancellation.
+  - An mkvtoolnix exit code of 1 (warnings only) is treated as success, with output verification still applied.
+  - Removals of tracks with no bitrate tags no longer fail the output size check.
+  - SSA subtitle tracks no longer break the alignment between mkvmerge and ffprobe.
+- **API and UI:**
+  - A request that fails validation no longer leaves some of its jobs queued.
+  - Dry runs show the engine's actual reason instead of "invalid request".
+  - Editing a library saved by an older version with a symlinked path no longer wipes its file list.
+  - The arr webhook matches libraries through symlinks.
+  - A browse root of `/` works.
+  - File list paging is stable.
+  - Pressing Enter in a dialog no longer acts as Cancel.
+  - Bursts of job events no longer push the UI past the read rate limit.
+- **MCP:**
+  - stdout carries only JSON-RPC from startup.
+  - SIGTERM exits cleanly.
+  - Notifications get no reply, and `ping` is answered.
+  - `queue_strip_job` with nothing to remove returns an error.
+  - `cancel_job` matches the REST behaviour.
+
+### Dependencies and build
+- Bumped `modernc.org/sqlite`, the Go toolchain (1.26.6, then aligned with the `golang:1.27-alpine` build image), the `golang` base image and GitHub Actions dependencies.
+- Pinned Alpine package versions for mkvtoolnix and tzdata. The healthcheck uses exec form, so hadolint passes.
+
 ## [0.6.0] - 2026-08-08
 
 Follow-up release to the 0.5.0 hardening pass. A full-codebase security audit produced 35

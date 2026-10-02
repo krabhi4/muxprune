@@ -55,3 +55,31 @@ func TestParseFFprobe_Valid(t *testing.T) {
 		t.Errorf("format parse: size=%d duration=%v", res.Size, res.Duration)
 	}
 }
+
+func TestParseFFprobe_BPSEngFallback(t *testing.T) {
+	data := []byte(`{"streams":[
+		{"index":0,"codec_type":"video","codec_name":"h264","tags":{"BPS":"1000"}},
+		{"index":1,"codec_type":"audio","codec_name":"aac","tags":{"BPS-eng":"640000"}}
+	],"format":{"format_name":"matroska,webm"}}`)
+	res, err := probe.ParseFFprobe(data, "x.mkv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Streams[0].BitRate != 1000 || res.Streams[1].BitRate != 640000 {
+		t.Errorf("bitrates = %d, %d; want 1000, 640000", res.Streams[0].BitRate, res.Streams[1].BitRate)
+	}
+}
+
+func TestParseFFprobe_AttachedPicIsAttachment(t *testing.T) {
+	data := []byte(`{"streams":[
+		{"index":0,"codec_type":"video","codec_name":"h264"},
+		{"index":1,"codec_type":"video","codec_name":"mjpeg","disposition":{"attached_pic":1}}
+	],"format":{"format_name":"matroska,webm"}}`)
+	res, err := probe.ParseFFprobe(data, "x.mkv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Streams[0].Type != "video" || res.Streams[1].Type != "attachment" {
+		t.Errorf("types = %q, %q; want video, attachment", res.Streams[0].Type, res.Streams[1].Type)
+	}
+}

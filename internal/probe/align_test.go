@@ -174,6 +174,7 @@ func TestCodecsCompatible(t *testing.T) {
 		{"A_FLAC", "flac", true},
 		{"S_TEXT/UTF8", "subrip", true},
 		{"S_TEXT/ASS", "ass", true},
+		{"S_TEXT/SSA", "ass", true},
 		{"S_HDMV/PGS", "hdmv_pgs_subtitle", true},
 		{"S_VOBSUB", "dvd_subtitle", true},
 		{"A_AAC", "ac3", false},

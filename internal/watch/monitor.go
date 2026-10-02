@@ -40,6 +40,7 @@ type Monitor struct {
 	ctx         context.Context
 	watchers    map[int64]*libWatcher
 	statuses    map[int64]string
+	catchup     map[int64]bool
 }
 
 func New(st Store, enqueue func(int64), cfg Config) *Monitor {
@@ -62,6 +63,7 @@ func New(st Store, enqueue func(int64), cfg Config) *Monitor {
 		events:      cfg.Events,
 		watchers:    map[int64]*libWatcher{},
 		statuses:    map[int64]string{},
+		catchup:     map[int64]bool{},
 	}
 }
 
@@ -154,14 +156,18 @@ func (m *Monitor) Reconcile() {
 	m.mu.Lock()
 	var toStop []*libWatcher
 	for id, w := range m.watchers {
-		if lib, ok := want[id]; !ok || !m.shouldWatch(lib) {
+		if lib, ok := want[id]; !ok || !m.shouldWatch(lib) || w.root != lib.Path {
 			toStop = append(toStop, w)
 			delete(m.watchers, id)
+			if ok {
+				m.catchup[id] = true
+			}
 		}
 	}
 	for id := range m.statuses {
 		if _, ok := want[id]; !ok {
 			delete(m.statuses, id)
+			delete(m.catchup, id)
 		}
 	}
 	m.mu.Unlock()
@@ -186,12 +192,13 @@ func (m *Monitor) Reconcile() {
 		existing := m.watchers[lib.ID]
 		m.mu.Unlock()
 		if existing != nil {
-			if !existing.isDead() {
+			if !existing.isDead() && existing.watchingRoot() {
 				continue
 			}
 			existing.stop()
 			m.mu.Lock()
 			delete(m.watchers, lib.ID)
+			m.catchup[lib.ID] = true
 			m.mu.Unlock()
 		}
 
@@ -202,7 +209,12 @@ func (m *Monitor) Reconcile() {
 		}
 		m.mu.Lock()
 		m.watchers[lib.ID] = w
+		catchup := m.catchup[lib.ID]
+		delete(m.catchup, lib.ID)
 		m.mu.Unlock()
+		if catchup {
+			w.schedule()
+		}
 		if w.isDegraded() {
 			m.setStatus(lib.ID, "watch-limit")
 		} else {

@@ -37,14 +37,9 @@ type jsonRPCError struct {
 	Message string `json:"message"`
 }
 
-// ServeMCP launches the Model Context Protocol (MCP) server over standard input/output.
-// It redirects normal logging prints on stdout to stderr to avoid corrupting the JSON-RPC channel.
-func (s *Server) ServeMCP(ctx context.Context) error {
-	// Save the original stdout for protocol messages.
-	originalStdout := os.Stdout
-	// Redirect any standard fmt.Printf or log output to stderr to keep stdout clean.
-	os.Stdout = os.Stderr
-
+// ServeMCP launches the Model Context Protocol (MCP) server over standard input,
+// writing JSON-RPC responses to out. The caller must keep all other output off out.
+func (s *Server) ServeMCP(ctx context.Context, out io.Writer) error {
 	// ReadBytes blocks until a newline arrives, so the read runs on its own
 	// goroutine and shutdown selects on ctx instead of waiting for input.
 	type readResult struct {
@@ -67,7 +62,7 @@ func (s *Server) ServeMCP(ctx context.Context) error {
 		var rr readResult
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil
 		case rr = <-lines:
 		}
 
@@ -81,7 +76,7 @@ func (s *Server) ServeMCP(ctx context.Context) error {
 
 		var req jsonRPCRequest
 		if err := json.Unmarshal(line, &req); err != nil {
-			sendMCPError(originalStdout, nil, -32700, "Parse error: "+err.Error())
+			sendMCPError(out, nil, -32700, "Parse error: "+err.Error())
 			continue
 		}
 
@@ -89,7 +84,7 @@ func (s *Server) ServeMCP(ctx context.Context) error {
 			continue // ignore notifications without methods or invalid json
 		}
 
-		s.handleMCPRequest(ctx, originalStdout, &req)
+		s.handleMCPRequest(ctx, out, &req)
 	}
 }
 
@@ -109,6 +104,9 @@ func (s *Server) handleMCPRequest(ctx context.Context, w io.Writer, req *jsonRPC
 
 	case "notifications/initialized", "initialized":
 		// No response required for notifications
+
+	case "ping":
+		sendMCPResponse(w, req.ID, map[string]any{})
 
 	case "tools/list":
 		tools := []map[string]any{
@@ -158,6 +156,8 @@ func (s *Server) handleMCPRequest(ctx context.Context, w io.Writer, req *jsonRPC
 						"file_id":        map[string]any{"type": "integer", "description": "The file ID"},
 						"audio_idx":      map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "Stream indexes of audio tracks to remove"},
 						"sub_idx":        map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "Stream indexes of subtitle tracks to remove"},
+						"expect_mtime":   map[string]any{"type": "integer", "description": "mtime from get_file; the job is refused if the file changed since"},
+						"expect_size":    map[string]any{"type": "integer", "description": "size from get_file; the job is refused if the file changed since"},
 						"allow_hardlink": map[string]any{"type": "boolean", "description": "Allow remuxing even if file is hardlinked (breaks seed links)"},
 					},
 					"required": []string{"file_id"},
@@ -177,7 +177,7 @@ func (s *Server) handleMCPRequest(ctx context.Context, w io.Writer, req *jsonRPC
 								"properties": map[string]any{
 									"track_index": map[string]any{"type": "integer", "description": "The ffprobe stream index"},
 									"language":    map[string]any{"type": "string", "description": "ISO 639-2 language tag (e.g. eng, jpn)"},
-									"title":       map[string]any{"type": "string", "description": "Track title/name"},
+									"title":       map[string]any{"type": "string", "description": "Track title/name; an empty string clears it, omit to leave unchanged"},
 									"default":     map[string]any{"type": "boolean", "description": "Set flag-default (true/false)"},
 									"forced":      map[string]any{"type": "boolean", "description": "Set flag-forced (true/false)"},
 								},
@@ -185,6 +185,9 @@ func (s *Server) handleMCPRequest(ctx context.Context, w io.Writer, req *jsonRPC
 							},
 							"description": "Array of metadata edits to apply",
 						},
+						"expect_mtime":   map[string]any{"type": "integer", "description": "mtime from get_file; the job is refused if the file changed since"},
+						"expect_size":    map[string]any{"type": "integer", "description": "size from get_file; the job is refused if the file changed since"},
+						"allow_hardlink": map[string]any{"type": "boolean", "description": "Allow editing even if file is hardlinked (the edit also changes every linked copy)"},
 					},
 					"required": []string{"file_id", "edits"},
 				},
@@ -195,8 +198,11 @@ func (s *Server) handleMCPRequest(ctx context.Context, w io.Writer, req *jsonRPC
 				"inputSchema": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"file_id":     map[string]any{"type": "integer", "description": "The file ID"},
-						"track_order": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "Desired track order of ffprobe stream indexes"},
+						"file_id":        map[string]any{"type": "integer", "description": "The file ID"},
+						"track_order":    map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "Desired track order of ffprobe stream indexes"},
+						"expect_mtime":   map[string]any{"type": "integer", "description": "mtime from get_file; the job is refused if the file changed since"},
+						"expect_size":    map[string]any{"type": "integer", "description": "size from get_file; the job is refused if the file changed since"},
+						"allow_hardlink": map[string]any{"type": "boolean", "description": "Allow remuxing even if file is hardlinked (breaks seed links)"},
 					},
 					"required": []string{"file_id", "track_order"},
 				},
@@ -209,6 +215,9 @@ func (s *Server) handleMCPRequest(ctx context.Context, w io.Writer, req *jsonRPC
 					"properties": map[string]any{
 						"file_id":        map[string]any{"type": "integer", "description": "The file ID"},
 						"external_files": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Absolute paths on server of external files to merge"},
+						"expect_mtime":   map[string]any{"type": "integer", "description": "mtime from get_file; the job is refused if the file changed since"},
+						"expect_size":    map[string]any{"type": "integer", "description": "size from get_file; the job is refused if the file changed since"},
+						"allow_hardlink": map[string]any{"type": "boolean", "description": "Allow remuxing even if file is hardlinked (breaks seed links)"},
 					},
 					"required": []string{"file_id", "external_files"},
 				},
@@ -293,6 +302,9 @@ func (s *Server) handleMCPRequest(ctx context.Context, w io.Writer, req *jsonRPC
 		s.handleMCPToolCall(ctx, w, req.ID, callParams.Name, callParams.Arguments)
 
 	default:
+		if req.ID == nil {
+			return
+		}
 		sendMCPError(w, req.ID, -32601, "Method not found: "+req.Method)
 	}
 }
@@ -364,7 +376,8 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 
 	case "queue_strip_job":
 		var sArgs struct {
-			FileID        int64 `json:"file_id"`
+			FileID int64 `json:"file_id"`
+			expectFile
 			AudioIdx      []int `json:"audio_idx"`
 			SubIdx        []int `json:"sub_idx"`
 			AllowHardlink bool  `json:"allow_hardlink"`
@@ -377,6 +390,10 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 			sendMCPToolError(w, id, fmt.Sprintf("audio_idx/sub_idx exceed the limit of %d entries", maxStreamIndexes))
 			return
 		}
+		if len(sArgs.AudioIdx) == 0 && len(sArgs.SubIdx) == 0 {
+			sendMCPToolError(w, id, "nothing to do")
+			return
+		}
 		detail, _, err := s.loadDetail(sArgs.FileID)
 		if err != nil {
 			sendMCPToolError(w, id, mcpErrMsg(err))
@@ -384,6 +401,10 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 		}
 		if detail == nil {
 			sendMCPToolError(w, id, "File not found")
+			return
+		}
+		if sArgs.changed(detail) {
+			sendMCPToolError(w, id, fileChangedMsg)
 			return
 		}
 
@@ -407,8 +428,10 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 
 	case "queue_metadata_job":
 		var mArgs struct {
-			FileID int64                 `json:"file_id"`
-			Edits  []engine.MetadataEdit `json:"edits"`
+			FileID int64 `json:"file_id"`
+			expectFile
+			Edits         []engine.MetadataEdit `json:"edits"`
+			AllowHardlink bool                  `json:"allow_hardlink"`
 		}
 		if err := json.Unmarshal(args, &mArgs); err != nil || mArgs.FileID == 0 || len(mArgs.Edits) == 0 {
 			sendMCPToolError(w, id, "Invalid arguments; edits list and file_id required")
@@ -427,12 +450,16 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 			sendMCPToolError(w, id, "File not found")
 			return
 		}
+		if mArgs.changed(detail) {
+			sendMCPToolError(w, id, fileChangedMsg)
+			return
+		}
 		if res == nil || !res.IsMatroska() {
 			sendMCPToolError(w, id, "Metadata editing requires a Matroska container")
 			return
 		}
 		j, err := s.Store.CreateJob("edit_metadata", detail.ID, detail.Path, jobs.EditMetadataPayload{
-			Edits: mArgs.Edits,
+			Edits: mArgs.Edits, AllowHardlink: mArgs.AllowHardlink,
 		})
 		if err != nil {
 			sendMCPToolError(w, id, mcpErrMsg(err))
@@ -444,8 +471,10 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 
 	case "queue_reorder_job":
 		var rArgs struct {
-			FileID     int64 `json:"file_id"`
-			TrackOrder []int `json:"track_order"`
+			FileID int64 `json:"file_id"`
+			expectFile
+			TrackOrder    []int `json:"track_order"`
+			AllowHardlink bool  `json:"allow_hardlink"`
 		}
 		if err := json.Unmarshal(args, &rArgs); err != nil || rArgs.FileID == 0 || len(rArgs.TrackOrder) == 0 {
 			sendMCPToolError(w, id, "Invalid arguments; track_order list and file_id required")
@@ -462,6 +491,10 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 		}
 		if detail == nil {
 			sendMCPToolError(w, id, "File not found")
+			return
+		}
+		if rArgs.changed(detail) {
+			sendMCPToolError(w, id, fileChangedMsg)
 			return
 		}
 		if res == nil || !res.IsMatroska() {
@@ -503,7 +536,7 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 		}
 
 		j, err := s.Store.CreateJob("reorder_tracks", detail.ID, detail.Path, jobs.ReorderPayload{
-			TrackOrder: rArgs.TrackOrder,
+			TrackOrder: rArgs.TrackOrder, AllowHardlink: rArgs.AllowHardlink,
 		})
 		if err != nil {
 			sendMCPToolError(w, id, mcpErrMsg(err))
@@ -515,8 +548,10 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 
 	case "queue_merge_job":
 		var mArgs struct {
-			FileID        int64    `json:"file_id"`
+			FileID int64 `json:"file_id"`
+			expectFile
 			ExternalFiles []string `json:"external_files"`
+			AllowHardlink bool     `json:"allow_hardlink"`
 		}
 		if err := json.Unmarshal(args, &mArgs); err != nil || mArgs.FileID == 0 || len(mArgs.ExternalFiles) == 0 {
 			sendMCPToolError(w, id, "Invalid arguments; external_files list and file_id required")
@@ -535,6 +570,10 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 			sendMCPToolError(w, id, "File not found")
 			return
 		}
+		if mArgs.changed(detail) {
+			sendMCPToolError(w, id, fileChangedMsg)
+			return
+		}
 		if res == nil || !res.IsMatroska() {
 			sendMCPToolError(w, id, "Track merging requires a Matroska container")
 			return
@@ -546,7 +585,7 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 		}
 
 		j, err := s.Store.CreateJob("merge_tracks", detail.ID, detail.Path, jobs.MergePayload{
-			ExternalFiles: mArgs.ExternalFiles,
+			ExternalFiles: mArgs.ExternalFiles, AllowHardlink: mArgs.AllowHardlink,
 		})
 		if err != nil {
 			sendMCPToolError(w, id, mcpErrMsg(err))
@@ -584,11 +623,15 @@ func (s *Server) handleMCPToolCall(ctx context.Context, w io.Writer, id *json.Ra
 			sendMCPToolError(w, id, "Invalid or missing job 'id' argument")
 			return
 		}
-		if err := s.Store.CancelJob(jArgs.ID); err != nil {
+		if s.Runner.Cancel(jArgs.ID) {
+			sendMCPToolResult(w, id, fmt.Sprintf("Job %d cancelling", jArgs.ID))
+			return
+		}
+		if err := s.cancelQueuedJob(jArgs.ID); err != nil {
 			sendMCPToolError(w, id, mcpErrMsg(err))
 			return
 		}
-		s.Hub.Notify("job", map[string]any{"id": jArgs.ID, "status": "failed", "log": "cancelled by user"})
+		s.Hub.Notify("job", map[string]any{"id": jArgs.ID, "status": "cancelled", "log": "cancelled by user"})
 		sendMCPToolResult(w, id, fmt.Sprintf("Job %d cancelled", jArgs.ID))
 
 	case "delete_job":

@@ -146,10 +146,10 @@
 
     <h3>Sidecar subtitles</h3>
     <div id="dlg-sidecars"></div>
-    <label class="checkline"><input type="checkbox" id="dlg-allow-hardlink"> Allow remux of hardlinked file (breaks seeding links)</label>
+    <label class="checkline"><input type="checkbox" id="dlg-allow-hardlink"> Allow changes to hardlinked file (breaks seeding links)</label>
     <div id="dlg-preview" class="preview" hidden></div>
     <div class="dialog-actions">
-      <button value="cancel" formnovalidate>Close</button>
+      <button type="button" value="cancel">Close</button>
       <span class="spacer"></span>
       <button type="button" id="dlg-dryrun">Preview</button>
       <button type="button" id="dlg-submit" class="danger">Queue removal</button>
@@ -189,7 +189,7 @@
     </label>
     <label class="checkline"><input type="checkbox" name="watch_enabled"> Real-time watch (local filesystems only; auto-disabled on network mounts)</label>
     <div class="dialog-actions">
-      <button value="cancel" formnovalidate>Cancel</button>
+      <button type="button" value="cancel">Cancel</button>
       <span class="spacer"></span>
       <button type="submit" id="dlg-library-save">Save</button>
     </div>
@@ -235,7 +235,7 @@
     <label class="checkline"><input type="checkbox" name="allow_hardlink"> Allow remux of hardlinked files</label>
     <div id="batch-preview" class="preview" hidden></div>
     <div class="dialog-actions">
-      <button value="cancel" formnovalidate>Cancel</button>
+      <button type="button" value="cancel">Cancel</button>
       <span class="spacer"></span>
       <button type="button" id="batch-dryrun">Preview</button>
       <button type="button" id="batch-submit" class="danger">Queue jobs</button>

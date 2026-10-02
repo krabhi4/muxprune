@@ -25,6 +25,6 @@ ENV MUXPRUNE_CONFIG=/config \
 
 VOLUME /config
 EXPOSE 8484
-HEALTHCHECK --interval=30s --timeout=5s CMD ["wget", "-qO-", "http://127.0.0.1:8484/api/v1/health"]
+HEALTHCHECK --interval=30s --timeout=5s CMD ["/bin/sh", "-c", "h=\"${MUXPRUNE_BIND:-127.0.0.1}\"; h=\"${h#\\[}\"; h=\"${h%\\]}\"; case \"$h\" in 0.0.0.0|::) h=127.0.0.1 ;; *:*) h=\"[$h]\" ;; esac; wget -qO- \"http://$h:${MUXPRUNE_PORT:-8484}/api/v1/health\" || exit 1"]
 
 ENTRYPOINT ["/entrypoint.sh"]

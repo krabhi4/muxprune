@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -105,8 +106,14 @@ CREATE TABLE IF NOT EXISTS settings (
 			return err
 		}
 	}
-	if err := s.addColumn("jobs", "attempts INTEGER NOT NULL DEFAULT 0"); err != nil {
-		return err
+	for _, col := range []string{
+		"attempts INTEGER NOT NULL DEFAULT 0",
+		"file_size INTEGER",
+		"file_mtime INTEGER",
+	} {
+		if err := s.addColumn("jobs", col); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -151,10 +158,21 @@ func (s *Store) AddLibrary(l *Library) error {
 }
 
 func (s *Store) UpdateLibrary(l *Library) error {
-	_, err := s.db.Exec(`UPDATE libraries SET name=?,path=?,kind=?,hardlink_policy=?,
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM media_files WHERE library_id=? AND (SELECT path FROM libraries WHERE id=?) != ?`,
+		l.ID, l.ID, l.Path); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE libraries SET name=?,path=?,kind=?,hardlink_policy=?,
 		auto_scan_interval=?,watch_enabled=? WHERE id=?`,
-		l.Name, l.Path, l.Kind, l.HardlinkPolicy, l.AutoScanInterval, l.WatchEnabled, l.ID)
-	return err
+		l.Name, l.Path, l.Kind, l.HardlinkPolicy, l.AutoScanInterval, l.WatchEnabled, l.ID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) DeleteLibrary(id int64) error {
@@ -221,6 +239,7 @@ type MediaFile struct {
 	SubSummary     string    `json:"sub_summary"`
 	SidecarSummary string    `json:"sidecar_summary"`
 	ProbeJSON      string    `json:"-"`
+	ScannedAt      int64     `json:"-"`
 	Sidecars       []Sidecar `json:"sidecars,omitempty"`
 }
 
@@ -248,7 +267,11 @@ func (s *Store) GetFileByPathMeta(path string) (id, size, mtime int64, nlink int
 }
 
 func (s *Store) UpsertMediaFile(f *MediaFile) error {
-	res, err := s.db.Exec(`
+	scannedAt := f.ScannedAt
+	if scannedAt == 0 {
+		scannedAt = time.Now().Unix()
+	}
+	return s.db.QueryRow(`
 INSERT INTO media_files(library_id,path,size,mtime,nlink,kind,series,season,episode,title,
 	video_codec,audio_summary,sub_summary,sidecar_summary,probe_json,scanned_at)
 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
@@ -258,40 +281,27 @@ ON CONFLICT(path) DO UPDATE SET
 	episode=excluded.episode, title=excluded.title, video_codec=excluded.video_codec,
 	audio_summary=excluded.audio_summary, sub_summary=excluded.sub_summary,
 	sidecar_summary=excluded.sidecar_summary, probe_json=excluded.probe_json,
-	scanned_at=excluded.scanned_at`,
+	scanned_at=max(media_files.scanned_at, excluded.scanned_at)
+RETURNING id`,
 		f.LibraryID, f.Path, f.Size, f.Mtime, f.Nlink, f.Kind, f.Series, f.Season, f.Episode,
 		f.Title, f.VideoCodec, f.AudioSummary, f.SubSummary, f.SidecarSummary, f.ProbeJSON,
-		time.Now().Unix())
-	if err != nil {
-		return err
-	}
-	if f.ID == 0 {
-		if id, err := res.LastInsertId(); err == nil && id != 0 {
-			f.ID = id
-		}
-		// LastInsertId is unreliable on upsert-update; fetch explicitly.
-		if f.ID == 0 {
-			err = s.db.QueryRow(`SELECT id FROM media_files WHERE path=?`, f.Path).Scan(&f.ID)
-		}
-	}
-	return err
+		scannedAt).Scan(&f.ID)
 }
 
 // TouchFile refreshes scan bookkeeping for files whose probe cache is still valid.
-func (s *Store) TouchFile(id int64, nlink int, sidecarSummary string) error {
-	_, err := s.db.Exec(`UPDATE media_files SET scanned_at=?, nlink=?, sidecar_summary=? WHERE id=?`,
-		time.Now().Unix(), nlink, sidecarSummary, id)
+func (s *Store) TouchFile(id int64, nlink int, sidecarSummary string, scannedAt int64) error {
+	_, err := s.db.Exec(`UPDATE media_files SET scanned_at=max(scanned_at, ?), nlink=?, sidecar_summary=? WHERE id=?`,
+		scannedAt, nlink, sidecarSummary, id)
 	return err
 }
 
 // TouchFilesBulk updates scanned_at for many file IDs in a single transaction,
 // batched to avoid exceeding SQLite's variable limit.
-func (s *Store) TouchFilesBulk(ids []int64) error {
+func (s *Store) TouchFilesBulk(ids []int64, scannedAt int64) error {
 	if len(ids) == 0 {
 		return nil
 	}
 	const batchSize = 500
-	now := time.Now().Unix()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -306,11 +316,11 @@ func (s *Store) TouchFilesBulk(ids []int64) error {
 		placeholders := strings.Repeat("?,", len(batch))
 		placeholders = placeholders[:len(placeholders)-1] // trim trailing comma
 		args := make([]any, 0, 1+len(batch))
-		args = append(args, now)
+		args = append(args, scannedAt)
 		for _, id := range batch {
 			args = append(args, id)
 		}
-		if _, err := tx.Exec(`UPDATE media_files SET scanned_at=? WHERE id IN (`+placeholders+`)`, args...); err != nil {
+		if _, err := tx.Exec(`UPDATE media_files SET scanned_at=max(scanned_at, ?) WHERE id IN (`+placeholders+`)`, args...); err != nil {
 			return err
 		}
 	}
@@ -320,6 +330,19 @@ func (s *Store) TouchFilesBulk(ids []int64) error {
 // PruneFiles removes records for files not seen since the given scan start.
 func (s *Store) PruneFiles(libraryID int64, scanStart int64) (int64, error) {
 	res, err := s.db.Exec(`DELETE FROM media_files WHERE library_id=? AND scanned_at<?`, libraryID, scanStart)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (s *Store) PruneFilesOutside(libraryID int64, root string) (int64, error) {
+	prefix := root
+	if !strings.HasSuffix(prefix, string(filepath.Separator)) {
+		prefix += string(filepath.Separator)
+	}
+	res, err := s.db.Exec(`DELETE FROM media_files WHERE library_id=? AND path!=? AND substr(path,1,length(?))!=?`,
+		libraryID, root, prefix, prefix)
 	if err != nil {
 		return 0, err
 	}
@@ -344,7 +367,9 @@ func (s *Store) ReplaceSidecars(fileID int64, scs []Sidecar) error {
 	}
 	for _, sc := range scs {
 		if _, err := tx.Exec(`INSERT INTO sidecars(media_file_id,path,name,lang,hi,forced,ext,size)
-			VALUES(?,?,?,?,?,?,?,?)`,
+			VALUES(?,?,?,?,?,?,?,?)
+			ON CONFLICT(path) DO UPDATE SET media_file_id=excluded.media_file_id, name=excluded.name,
+				lang=excluded.lang, hi=excluded.hi, forced=excluded.forced, ext=excluded.ext, size=excluded.size`,
 			fileID, sc.Path, sc.Name, sc.Lang, sc.HI, sc.Forced, sc.Ext, sc.Size); err != nil {
 			return err
 		}
@@ -463,7 +488,7 @@ func (s *Store) ListFiles(f FileFilter) ([]MediaFile, int, error) {
 	for i := range parts {
 		parts[i] = strings.TrimSpace(parts[i]) + " " + orderDir
 	}
-	sortClause := strings.Join(parts, ", ")
+	sortClause := strings.Join(parts, ", ") + ", id " + orderDir
 
 	rows, err := s.db.Query(`SELECT id,library_id,path,size,mtime,nlink,kind,series,season,episode,title,
 		video_codec,audio_summary,sub_summary,sidecar_summary
@@ -527,6 +552,8 @@ type Job struct {
 	Payload    json.RawMessage `json:"payload"`
 	Status     string          `json:"status"` // queued, running, done, failed, skipped
 	Attempts   int             `json:"attempts"`
+	FileSize   sql.NullInt64   `json:"-"`
+	FileMtime  sql.NullInt64   `json:"-"`
 	Log        string          `json:"log"`
 	BytesSaved int64           `json:"bytes_saved"`
 	CreatedAt  int64           `json:"created_at"`
@@ -546,14 +573,16 @@ func (s *Store) CreateJob(jobType string, fileID int64, filePath string, payload
 		return nil, err
 	}
 	now := time.Now().Unix()
-	res, err := s.db.Exec(`INSERT INTO jobs(type,media_file_id,file_path,payload_json,status,created_at)
-		VALUES(?,?,?,?,'queued',?)`, jobType, nullable(fileID), filePath, string(pj), now)
+	j := &Job{Type: jobType, FileID: sql.NullInt64{Int64: fileID, Valid: fileID != 0},
+		FilePath: filePath, Payload: pj, Status: "queued", CreatedAt: now}
+	err = s.db.QueryRow(`INSERT INTO jobs(type,media_file_id,file_path,payload_json,status,created_at,file_size,file_mtime)
+		VALUES(?,?,?,?,'queued',?,(SELECT size FROM media_files WHERE id=?),(SELECT mtime FROM media_files WHERE id=?))
+		RETURNING id,file_size,file_mtime`, jobType, nullable(fileID), filePath, string(pj), now, fileID, fileID).
+		Scan(&j.ID, &j.FileSize, &j.FileMtime)
 	if err != nil {
 		return nil, err
 	}
-	id, _ := res.LastInsertId()
-	return &Job{ID: id, Type: jobType, FileID: sql.NullInt64{Int64: fileID, Valid: fileID != 0},
-		FilePath: filePath, Payload: pj, Status: "queued", CreatedAt: now}, nil
+	return j, nil
 }
 
 func nullable(id int64) any {
@@ -563,10 +592,26 @@ func nullable(id int64) any {
 	return id
 }
 
+func (s *Store) HardlinkPolicyProceeds(fileID int64) bool {
+	var policy string
+	err := s.db.QueryRow(`SELECT l.hardlink_policy FROM media_files f JOIN libraries l
+		ON f.path = l.path OR substr(f.path, 1, length(rtrim(l.path, '/')) + 1) = rtrim(l.path, '/') || '/'
+		WHERE f.id=? ORDER BY length(l.path) DESC LIMIT 1`, fileID).Scan(&policy)
+	return err == nil && policy == "proceed"
+}
+
 func (s *Store) IsScanActive(libraryID int64) (bool, error) {
+	return s.scanInStatus(libraryID, "'queued','running'")
+}
+
+func (s *Store) IsScanQueued(libraryID int64) (bool, error) {
+	return s.scanInStatus(libraryID, "'queued'")
+}
+
+func (s *Store) scanInStatus(libraryID int64, statuses string) (bool, error) {
 	// First check if scan_all is running or queued
 	var activeScanAll int
-	err := s.db.QueryRow(`SELECT count(*) FROM jobs WHERE type='scan_all' AND status IN ('queued','running')`).Scan(&activeScanAll)
+	err := s.db.QueryRow(`SELECT count(*) FROM jobs WHERE type='scan_all' AND status IN (` + statuses + `)`).Scan(&activeScanAll)
 	if err != nil {
 		return false, err
 	}
@@ -575,7 +620,7 @@ func (s *Store) IsScanActive(libraryID int64) (bool, error) {
 	}
 
 	// Next check if scan_library is running or queued for this library
-	rows, err := s.db.Query(`SELECT payload_json FROM jobs WHERE type='scan_library' AND status IN ('queued','running')`)
+	rows, err := s.db.Query(`SELECT payload_json FROM jobs WHERE type='scan_library' AND status IN (` + statuses + `)`)
 	if err != nil {
 		return false, err
 	}
@@ -612,8 +657,8 @@ func (s *Store) ClaimNextJob() (*Job, error) {
 	var payload string
 	err := s.db.QueryRow(`UPDATE jobs SET status='running'
 		WHERE id=(SELECT id FROM jobs WHERE status='queued' ORDER BY id LIMIT 1)
-		RETURNING id,type,media_file_id,file_path,payload_json,attempts,created_at`).
-		Scan(&j.ID, &j.Type, &j.FileID, &j.FilePath, &payload, &j.Attempts, &j.CreatedAt)
+		RETURNING id,type,media_file_id,file_path,payload_json,attempts,created_at,file_size,file_mtime`).
+		Scan(&j.ID, &j.Type, &j.FileID, &j.FilePath, &payload, &j.Attempts, &j.CreatedAt, &j.FileSize, &j.FileMtime)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -647,27 +692,25 @@ func (s *Store) CancelJob(id int64) error {
 }
 
 func (s *Store) RetryJob(id int64) (*Job, error) {
-	j, err := s.GetJob(id)
-	if err != nil {
-		return nil, err
-	}
-	if j == nil {
-		return nil, fmt.Errorf("job %d not found", id)
-	}
-	switch j.Status {
-	case "failed", "skipped", "cancelled":
-	default:
+	var newID int64
+	err := s.db.QueryRow(`INSERT INTO jobs(type,media_file_id,file_path,payload_json,status,created_at,attempts,file_size,file_mtime)
+		SELECT type,media_file_id,file_path,payload_json,'queued',?,attempts+1,file_size,file_mtime
+		FROM jobs WHERE id=? AND status IN ('failed','skipped','cancelled')
+		RETURNING id`, time.Now().Unix(), id).Scan(&newID)
+	if err == sql.ErrNoRows {
+		j, gerr := s.GetJob(id)
+		if gerr != nil {
+			return nil, gerr
+		}
+		if j == nil {
+			return nil, fmt.Errorf("job %d not found", id)
+		}
 		return nil, fmt.Errorf("job %d is %s and cannot be retried", id, j.Status)
 	}
-	nj, err := s.CreateJob(j.Type, j.MediaFileID(), j.FilePath, j.Payload)
 	if err != nil {
 		return nil, err
 	}
-	nj.Attempts = j.Attempts + 1
-	if _, err := s.db.Exec(`UPDATE jobs SET attempts=? WHERE id=?`, nj.Attempts, nj.ID); err != nil {
-		return nil, err
-	}
-	return nj, nil
+	return s.GetJob(newID)
 }
 
 func (s *Store) DeleteJob(id int64) error {
@@ -749,10 +792,10 @@ func (s *Store) ListJobs(status string, limit, offset int) ([]Job, int, error) {
 func (s *Store) GetJob(id int64) (*Job, error) {
 	j := &Job{}
 	var payload string
-	err := s.db.QueryRow(`SELECT id,type,media_file_id,file_path,payload_json,status,attempts,log,bytes_saved,created_at,finished_at
+	err := s.db.QueryRow(`SELECT id,type,media_file_id,file_path,payload_json,status,attempts,log,bytes_saved,created_at,finished_at,file_size,file_mtime
 		FROM jobs WHERE id=?`, id).
 		Scan(&j.ID, &j.Type, &j.FileID, &j.FilePath, &payload, &j.Status, &j.Attempts, &j.Log,
-			&j.BytesSaved, &j.CreatedAt, &j.FinishedAt)
+			&j.BytesSaved, &j.CreatedAt, &j.FinishedAt, &j.FileSize, &j.FileMtime)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
