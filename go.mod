@@ -5,7 +5,7 @@ go 1.27.1
 require (
 	github.com/fsnotify/fsnotify v1.10.1
 	golang.org/x/sys v0.48.0
-	modernc.org/sqlite v1.60.0
+	modernc.org/sqlite v1.60.1
 )
 
 require (
